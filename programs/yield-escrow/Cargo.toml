@@ -1,0 +1,28 @@
+[package]
+name = "yield-escrow"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "yield_escrow"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "staking/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true }
+anchor-spl = { workspace = true }
+solana-security-txt = { workspace = true }
+# HIGH-X5 (2026-05-14 cross-audit pass 2): typed deserialize of
+# StakingConfig in rollover_epoch instead of raw byte-offset read at
+# u128::from_le_bytes(data[80..96]). Path-dep on the staking crate keeps the
+# field offset auto-tracked by Anchor — re-ordering StakingConfig fields will
+# no longer silently corrupt the yield rollover snapshot. No circular dep
+# risk: staking does not depend on yield-escrow.
+staking = { path = "../staking", features = ["cpi"] }

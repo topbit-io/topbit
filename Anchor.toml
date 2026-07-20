@@ -1,0 +1,41 @@
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.mainnet]
+tlp_provider_vault = "CtB3xQvmUGZtFRALhmkhhissargBJ51WPLCDFhGVy6Lx"
+sovereign_registry = "14ndgn3yKuD4Zi3ozBt7Fo4cYzUuYDAZrTn15wT3rFC2"
+affiliate_registry = "GcLnquNequt8UwNigWDzyfA2DpeeTMnQnyUbHxHL8cfC"
+staking = "2n2puiEN8BbMMEtq387b6HKR2trvKY9rK5uM82Ht2Vtc"
+yield_escrow = "85b3FfAzz3akfnH7NPCqR4Pjna45N3N6e6MvPsxABJ6n"
+swap_router = "9tkZMhH7cf293wpGpJycqsZLb8eojkJ5jyUHJtqcS5zR"
+etop_escrow = "Aa9CbHs9yDt52x4jfyQfeyb6R7nYxUjABvYbbcgRMuro"
+
+[programs.devnet]
+affiliate_registry = "6A4NechP9CdQcssSqVvE2wAutQe4q1KQ5gcmrUUy8JYV"
+etop_escrow = "Bkw2xBfKM9WeCQyt1Qa4pdX6AXkUVqdKMUfuYPz3X2ye"
+sovereign_registry = "9k3ea6MCeu9hCZaGvWGXfjo3mXeoJ91xN78e3G6t32LV"
+staking = "CEqqH3JFjngN31dJwPFHtWWVDUGUiE1tETLRkDisaDUr"
+tlp_originals_vault = "2QsV2v2v7EKGrr9B4AkXwTwwgGinYGSn8M7vFdrDZSP7"
+yield_escrow = "A2HkY2wL8P57ng1xvN3Y75XJp4jVyXGy5u6FsoYxYNFM"
+# topbit_games devnet ID — to be assigned at devnet promote.
+# swap_router devnet ID — to be assigned at devnet promote (uses localnet ID
+# DEoh6p6Hoa6YU3ybWhSGGNtG9HTJhW8vkrnHV7KJ8rAq below until then).
+
+[programs.localnet]
+tlp_provider_vault = "CtB3xQvmUGZtFRALhmkhhissargBJ51WPLCDFhGVy6Lx"
+sovereign_registry = "14ndgn3yKuD4Zi3ozBt7Fo4cYzUuYDAZrTn15wT3rFC2"
+affiliate_registry = "GcLnquNequt8UwNigWDzyfA2DpeeTMnQnyUbHxHL8cfC"
+staking = "2n2puiEN8BbMMEtq387b6HKR2trvKY9rK5uM82Ht2Vtc"
+yield_escrow = "85b3FfAzz3akfnH7NPCqR4Pjna45N3N6e6MvPsxABJ6n"
+swap_router = "9tkZMhH7cf293wpGpJycqsZLb8eojkJ5jyUHJtqcS5zR"
+etop_escrow = "Aa9CbHs9yDt52x4jfyQfeyb6R7nYxUjABvYbbcgRMuro"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"

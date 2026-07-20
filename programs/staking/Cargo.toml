@@ -1,0 +1,28 @@
+[package]
+name = "staking"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "staking"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true, features = ["init-if-needed"] }
+anchor-spl = { workspace = true }
+solana-security-txt = { workspace = true }
+sovereign-registry = { path = "../sovereign-registry", features = ["cpi"] }
+
+[dev-dependencies]
+# proptest 1.x — validator-fuzzed property suite (layer a) over the H-01
+# accumulator money-math (settle/remark + the R6-ECON-01 forfeit). Pinned to the
+# same line as tlp-provider-vault for a consistent host-test toolchain.
+proptest = "1"

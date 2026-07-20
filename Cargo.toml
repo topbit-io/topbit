@@ -1,0 +1,22 @@
+[workspace]
+# The seven deployed TopBit v1 Solana programs. Published for independent
+# verification and audit only (see LICENSE).
+members = [
+    "programs/staking",
+    "programs/etop-escrow",
+    "programs/yield-escrow",
+    "programs/affiliate-registry",
+    "programs/sovereign-registry",
+    "programs/swap-router",
+    "programs/tlp-provider-vault",
+]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true
+
+[workspace.dependencies]
+anchor-lang = "0.32.0"
+anchor-spl = "0.32.0"
+solana-program = "1.18.17"
+solana-security-txt = "1.1.1"

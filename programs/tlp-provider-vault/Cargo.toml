@@ -1,0 +1,54 @@
+[package]
+name = "tlp-provider-vault"
+version = "0.1.0"
+edition = "2021"
+description = "TopBit v2 LP bankroll for partner-aggregator games (Pragmatic Play, BGaming, Spribe, Hacksaw, …)"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "tlp_provider_vault"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+# Propagate mock-swap to swap-router for localnet tests.
+# Anchor.toml localnet profile enables this; mainnet builds must NOT carry it.
+mock-swap = ["swap-router/mock-swap"]
+
+[dependencies]
+anchor-lang = { workspace = true, features = ["init-if-needed"] }
+anchor-spl = { workspace = true }
+solana-security-txt = { workspace = true }
+# D5 (2026-05-15) — CPI deps for the weekly waterfall:
+#   sovereign-registry: 5% royalty carve via deposit_royalty (Q1 LOCKED — shared
+#     pool across native + provider vaults).
+#   yield-escrow:       provider sub-pool feed via deposit_provider_yield
+#     (§13 Q3 LOCKED — extend yield_escrow instead of a new program).
+# Both pulled with the `cpi` feature so the auto-generated CpiContext + accounts
+# types are reachable. No circular dep: neither downstream crate depends on
+# tlp-provider-vault.
+sovereign-registry = { path = "../sovereign-registry", features = ["cpi"] }
+yield-escrow = { path = "../yield-escrow", features = ["cpi"] }
+# v2.0 Pattern Y affiliate flow: distribute_affiliate CPIs into
+# affiliate_registry::deposit_funding_pool — see lib.rs §"Drain Instructions".
+affiliate-registry = { path = "../affiliate-registry", features = ["cpi"] }
+# D6 (2026-05-19) — swap_router CPI for distribute_reserve mode-1 burn leg.
+# swap_usdc_to_top CPIs out of tlp_provider_vault when reserve_burn_mode == 1.
+swap-router = { path = "../swap-router", features = ["cpi"] }
+
+[profile.release]
+overflow-checks = true
+strip = "symbols"
+
+# Fuzz / property-test harness (host target only — never compiled into the .so).
+# Drives the PUBLIC earmark/waterfall API (accrue_earmarks, sum_earmarks,
+# require_earmark_invariant, compute_swap_credit, compute_net_ggr, phase_split_bps)
+# across randomized instruction sequences. See tests/fuzz_k4_invariants.rs.
+# proptest 1.x is the last release line supporting Rust 2021 / 1.7x+; pinned
+# loosely so `cargo test` resolves a compatible patch in WSL.
+[dev-dependencies]
+proptest = "1"

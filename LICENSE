@@ -1,0 +1,11 @@
+TopBit Source-Available License (Verification and Audit Only)
+
+Copyright (c) 2026 TopBit. All rights reserved.
+
+This source code is published solely to permit independent verification and audit. Any person may view, read, download, and compile this source code for the sole purposes of (a) verifying that it corresponds to the on-chain program bytecode published by the copyright holder, and (b) reviewing or auditing it for correctness and security.
+
+No other rights are granted. Without the copyright holder's prior written permission, you may not use, deploy, run, operate, host, distribute, sublicense, sell, modify, or create derivative works from this source code, in whole or in part, and you may not use it in any production or commercial system. Permission to compile is limited to the verification and audit purposes stated above and confers no right to run or deploy the resulting binaries.
+
+This license grants no trademark, patent, or other intellectual property right except the limited copyright permission stated above. This license does not now, and will not at any future date, convert to an open-source or free-software license.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -1,0 +1,25 @@
+[package]
+name = "affiliate-registry"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "affiliate_registry"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+# init-if-needed: required by the AFFIL-REPLAY-01 per-commission receipt PDA in
+# record_commission_v2 (mirrors tlp-provider-vault's CreditReceipt). Safe here —
+# the receipt seeds are fully deterministic and a re-init no-ops (recorded flag
+# guards the replay), so there is no re-initialization attack surface.
+anchor-lang = { workspace = true, features = ["init-if-needed"] }
+anchor-spl = { workspace = true }
+solana-security-txt = { workspace = true }

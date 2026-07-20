@@ -1,0 +1,26 @@
+[package]
+name = "swap-router"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "swap_router"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+# Localnet-only mock swap path — set 1 SOL = 100 $TOP at a fixed rate without
+# any AMM math. Cargo never enables this by default; the integration test
+# script + `anchor build -- --features mock-swap` opt-in explicitly. Mainnet
+# builds MUST NOT carry this flag — see `assert_no_mock_swap_in_release` test.
+mock-swap = []
+
+[dependencies]
+anchor-lang = { workspace = true }
+anchor-spl = { workspace = true }
+solana-security-txt = { workspace = true }
