@@ -645,16 +645,6 @@ pub mod tlp_provider_vault {
 
         let holder_balance = ctx.accounts.vault_holder.amount;
 
-        let receipt_cap: u128 = ((holder_balance as u128)
-            .checked_mul(MAX_NET_GGR_PER_RECEIPT_BPS as u128)
-            .ok_or(ProviderVaultError::MathOverflow)?
-            / 10_000u128)
-            .max(NET_GGR_CAP_FLOOR_USDC as u128);
-        require!(
-            (net_ggr_signed as i128) <= receipt_cap as i128,
-            ProviderVaultError::GgrExceedsCap
-        );
-
         let snapshot_bps = provider.provider_fee_bps;
 
         let fee_due: u64 = if net_ggr_signed > 0 {
