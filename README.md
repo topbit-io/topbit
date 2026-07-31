@@ -61,7 +61,7 @@ sha256sum target/deploy/<library_name>.so
 The raw `sha256sum` of each locally rebuilt `target/deploy/<library>.so` is:
 
 ```
-tlp_provider_vault  30f9c83d06dd37ab1bd1e12ef7f0e9c2035f0a6e0ac08b40584617f73ba7907d
+tlp_provider_vault  25413af8751844780a91386c787726255ec7a6a480e7e1842cd8645f8523fbc2
 staking             7ce80871e7d94252f1ec8d9091434ac0f6d86dbb7d6791df00a1750bf949bf3c
 etop_escrow         6c85caf6c2b5a711add09a35560b1809df1cfe1e717129cdd561462db08e9d45
 yield_escrow        a706e33775b563b5e70caac7d55aad7ed071cb65a1ccf64f7d2ab878bea532c6

@@ -645,6 +645,7 @@ pub mod tlp_provider_vault {
 
         let holder_balance = ctx.accounts.vault_holder.amount;
 
+
         let snapshot_bps = provider.provider_fee_bps;
 
         let fee_due: u64 = if net_ggr_signed > 0 {
@@ -680,13 +681,20 @@ pub mod tlp_provider_vault {
         provider.last_submission_at = Clock::get()?.unix_timestamp;
         provider.last_day_id = day_id;
 
+        let cum_before_ggr = pool.cumulative_gross_ggr;
         pool.cumulative_gross_ggr = pool
             .cumulative_gross_ggr
             .checked_add(net_ggr_signed)
             .ok_or(ProviderVaultError::MathOverflow)?;
 
+        let accrual_base_signed = effective_accrual_base(
+            pool.last_distributed_gross_ggr,
+            cum_before_ggr,
+            net_ggr_signed,
+        )?;
+
         let after_provider_for_net: u64 = if net_ggr_signed > 0 {
-            (net_ggr_signed as u64).saturating_sub(fee_due)
+            (accrual_base_signed as u64).saturating_sub(fee_due)
         } else {
             0
         };
@@ -703,7 +711,7 @@ pub mod tlp_provider_vault {
 
         accrue_earmarks(
             pool,
-            net_ggr_signed,
+            accrual_base_signed,
             config.phase,
             snapshot_bps,
             fee_due,
@@ -848,14 +856,13 @@ pub mod tlp_provider_vault {
                     timestamp: now,
                 });
             }
-            pool.last_distributed_gross_ggr = pool.cumulative_gross_ggr;
             if !is_keeper {
                 pool.last_distributed_at = now;
             }
             return Ok(());
         }
 
-        pool.last_distributed_gross_ggr = pool.cumulative_gross_ggr;
+        advance_hwm_on_drain(pool);
         if !is_keeper {
             pool.last_distributed_at = now;
         }
@@ -2632,6 +2639,8 @@ pub mod tlp_provider_vault {
         let amount = pool.pending_affiliate;
         require!(amount > 0, ProviderVaultError::NothingToDrain);
 
+        advance_hwm_on_drain(pool);
+
         pool.pending_affiliate = 0;
         pool.last_distributed_affiliate = pool
             .last_distributed_affiliate
@@ -2706,6 +2715,8 @@ pub mod tlp_provider_vault {
 
         let amount = pool.pending_sovereign;
         require!(amount > 0, ProviderVaultError::NothingToDrain);
+
+        advance_hwm_on_drain(pool);
 
         if pool.is_sol {
             return err!(ProviderVaultError::SolPondNotImplemented);
@@ -2795,6 +2806,8 @@ pub mod tlp_provider_vault {
 
         let amount = pool.pending_yield;
         require!(amount > 0, ProviderVaultError::NothingToDrain);
+
+        advance_hwm_on_drain(pool);
 
         pool.pending_yield = 0;
 
@@ -2958,6 +2971,8 @@ pub mod tlp_provider_vault {
         let amount = pool.pending_reserve;
         require!(amount > 0, ProviderVaultError::NothingToDrain);
 
+        advance_hwm_on_drain(pool);
+
         let mode = config.reserve_burn_mode;
 
         pool.pending_reserve = 0;
@@ -3119,8 +3134,23 @@ pub mod tlp_provider_vault {
             ProviderVaultError::CircuitBreakerYieldPaused
         );
 
+        let caller = ctx.accounts.signer.key();
+        let is_operator = caller == config.operator_pubkey
+            || caller == config.waterfall_authority;
+        let is_keeper_eligible = now
+            >= pool
+                .last_distributed_at
+                .checked_add(KEEPER_WINDOW_SECONDS)
+                .ok_or(ProviderVaultError::MathOverflow)?;
+        require!(
+            is_operator || is_keeper_eligible,
+            ProviderVaultError::Unauthorized
+        );
+
         let amount = pool.pending_dev_fee;
         require!(amount > 0, ProviderVaultError::NothingToDrain);
+
+        advance_hwm_on_drain(pool);
 
         pool.pending_dev_fee = 0;
 
@@ -4283,6 +4313,29 @@ pub fn compute_weighted_lp_bps(pool: &AssetPool, phase: u8, fb_tokens_in_window:
     Ok((weighted_sum / total) as u64)
 }
 
+pub fn effective_accrual_base(
+    hwm: i64,
+    cum_before: i64,
+    net_ggr_signed: i64,
+) -> Result<i64> {
+    if net_ggr_signed <= 0 {
+        return Ok(net_ggr_signed);
+    }
+    let cum_after = cum_before
+        .checked_add(net_ggr_signed)
+        .ok_or(ProviderVaultError::MathOverflow)?;
+    let water_line = hwm.max(cum_before).max(0);
+    let above = cum_after
+        .checked_sub(water_line)
+        .ok_or(ProviderVaultError::MathOverflow)?;
+    Ok(if above > 0 { above } else { 0 })
+}
+
+pub fn advance_hwm_on_drain(pool: &mut AssetPool) {
+    let floored = pool.last_distributed_gross_ggr.max(0);
+    pool.last_distributed_gross_ggr = floored.max(pool.cumulative_gross_ggr);
+}
+
 pub fn accrue_earmarks(
     pool: &mut AssetPool,
     net_delta_signed: i64,
@@ -4306,9 +4359,7 @@ pub fn accrue_earmarks(
             .ok_or(ProviderVaultError::MathOverflow)?;
 
 
-        let after_provider = net_delta
-            .checked_sub(fee_due)
-            .ok_or(ProviderVaultError::MathOverflow)?;
+        let after_provider = net_delta.saturating_sub(fee_due);
 
         require!(cost_netted <= after_provider, ProviderVaultError::PromoNetExceedsBase);
         let distribution_base = after_provider
@@ -8583,7 +8634,7 @@ mod tests {
 
 
     #[test]
-    fn sweep_skip_advances_last_distributed() {
+    fn sweep_skip_does_not_advance_last_distributed() {
         let mut p = fresh_pool(Pubkey::new_unique());
         p.cumulative_gross_ggr = 1_000;
         p.last_distributed_gross_ggr = 0;
@@ -8591,9 +8642,81 @@ mod tests {
         let delta_gross = p.cumulative_gross_ggr - p.last_distributed_gross_ggr;
         let net = delta_gross - p.pending_affiliate as i64;
         assert!(net < 0);
-        p.last_distributed_gross_ggr = p.cumulative_gross_ggr;
-        assert_eq!(p.last_distributed_gross_ggr, 1_000);
+        assert_eq!(
+            p.last_distributed_gross_ggr, 0,
+            "the skip branch must leave the HWM where it was — the delta is re-tried \
+             (larger) next cycle, and the profit stays earmarked meanwhile"
+        );
         assert_eq!(p.pending_affiliate, 5_000);
+    }
+
+    #[test]
+    fn drain_hwm_advance_is_max_never_lowers() {
+        let mut p = fresh_pool(Pubkey::new_unique());
+        p.last_distributed_gross_ggr = 1_000;
+        p.cumulative_gross_ggr = 2_500;
+        advance_hwm_on_drain(&mut p);
+        assert_eq!(p.last_distributed_gross_ggr, 2_500);
+        p.cumulative_gross_ggr = 900;
+        advance_hwm_on_drain(&mut p);
+        assert_eq!(
+            p.last_distributed_gross_ggr, 2_500,
+            "max() is load-bearing: lowering the mark would let a recovery re-accrue \
+             buckets whose funds already left the vault"
+        );
+        p.cumulative_gross_ggr = -1_851_640_000;
+        advance_hwm_on_drain(&mut p);
+        assert_eq!(p.last_distributed_gross_ggr, 2_500);
+        p.last_distributed_gross_ggr = -1_851_644_605;
+        p.cumulative_gross_ggr = -1_851_644_605;
+        advance_hwm_on_drain(&mut p);
+        assert_eq!(
+            p.last_distributed_gross_ggr, 0,
+            "a negative bookmark can only be the pre-upgrade skip artifact — normalize it"
+        );
+    }
+
+    #[test]
+    fn effective_accrual_base_floors_a_poisoned_negative_bookmark_at_zero() {
+        let poisoned = -1_851_644_605i64;
+        assert_eq!(effective_accrual_base(poisoned, poisoned, 800_000_000).unwrap(), 0);
+        assert_eq!(
+            effective_accrual_base(poisoned, -500_000_000, 1_500_000_000).unwrap(),
+            1_000_000_000,
+            "measured from 0, not from the poisoned mark (which would give the full 1.5e9)"
+        );
+        assert_eq!(
+            effective_accrual_base(-1_000_000_000, -1_000_000_000, 1_500_000_000).unwrap(),
+            500_000_000
+        );
+        assert_eq!(effective_accrual_base(poisoned, 2_000, 500).unwrap(), 500);
+        for &(hwm, cum, net) in &[(0i64, 0i64, 1_500i64), (2_000, 1_700, 500), (500, 500, 1_500)] {
+            assert_eq!(
+                effective_accrual_base(hwm, cum, net).unwrap(),
+                effective_accrual_base(hwm.max(0), cum, net).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn effective_accrual_base_carries_losses_and_never_inflates() {
+        assert_eq!(effective_accrual_base(0, 0, 1_500).unwrap(), 1_500);
+        assert_eq!(effective_accrual_base(500, 500, 1_500).unwrap(), 1_500);
+        assert_eq!(effective_accrual_base(0, -500, 1_500).unwrap(), 1_000);
+        assert_eq!(effective_accrual_base(0, -1_851, 800).unwrap(), 0);
+        assert_eq!(effective_accrual_base(2_000, 1_700, 200).unwrap(), 0);
+        assert_eq!(effective_accrual_base(2_000, 1_700, 500).unwrap(), 200);
+        assert_eq!(effective_accrual_base(0, 1_000, -300).unwrap(), -300);
+        assert_eq!(effective_accrual_base(0, 1_000, 0).unwrap(), 0);
+        for &(hwm, cum, net) in &[
+            (0i64, 0i64, 1i64),
+            (-5, -10, 3),
+            (7, 2, 9),
+            (-1_000, 4_000, 1_000),
+        ] {
+            let e = effective_accrual_base(hwm, cum, net).unwrap();
+            assert!(e >= 0 && e <= net, "E={e} must be in [0, net={net}]");
+        }
     }
 
 
@@ -10774,8 +10897,8 @@ mod tests {
             "A caller supplying wrong_mint as swap_router_usdc_holder \
              is now caught by Anchor at parse time (token::mint = asset_mint)");
     }
-    
-    
+
+
     #[test]
     fn outflow_breaker_constants_match_spec() {
         assert_eq!(DEFAULT_MAX_SETTLE_PER_WINDOW, 50_000_000_000,
@@ -10787,7 +10910,7 @@ mod tests {
         assert_eq!(MIN_SETTLE_WINDOW_SECONDS, 30);
         assert_eq!(MAX_SETTLE_WINDOW_SECONDS, 86_400);
     }
-    
+
     #[test]
     fn outflow_breaker_defaults_at_init() {
         let cfg = minimal_vault_config(Pubkey::new_unique());
@@ -10801,21 +10924,18 @@ mod tests {
         assert_eq!(cfg.pending_settle_window_seconds, 0);
         assert_eq!(cfg.pending_settle_window_seconds_unlocks_at, 0);
     }
-    
+
     #[derive(Debug, PartialEq, Eq)]
     enum BreakerOutcome {
-        
         Passed(u64),
-        
         Tripped,
     }
-    
+
     fn simulate_outflow_check(
         cfg: &mut VaultConfig,
         now: i64,
         amount: u64,
     ) -> std::result::Result<BreakerOutcome, &'static str> {
-        
         let window_end = cfg.window_start.saturating_add(cfg.settle_window_seconds as i64);
         if cfg.window_start == 0 || now >= window_end {
             cfg.window_outflow = 0;
@@ -10825,32 +10945,29 @@ mod tests {
             .checked_add(amount)
             .ok_or("overflow")?;
         if projected > cfg.max_settle_per_window {
-            
             cfg.is_frozen = true;
             return Ok(BreakerOutcome::Tripped);
         }
-        
         cfg.window_outflow = projected;
         Ok(BreakerOutcome::Passed(projected))
     }
-    
+
     #[test]
     fn settle_within_window_cap_passes() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         let now: i64 = 1_700_000_000;
-        let amount: u64 = 10_000_000_000; 
+        let amount: u64 = 10_000_000_000;
         let r = simulate_outflow_check(&mut cfg, now, amount).unwrap();
         assert_eq!(r, BreakerOutcome::Passed(amount));
         assert_eq!(cfg.window_outflow, amount);
         assert_eq!(cfg.window_start, now, "window_start anchored on first settle");
         assert!(!cfg.is_frozen);
     }
-    
+
     #[test]
     fn cumulative_settles_within_cap_pass() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         let t0: i64 = 1_700_000_000;
-        
         for offset in [0i64, 60, 120, 180] {
             let r = simulate_outflow_check(&mut cfg, t0 + offset, 10_000_000_000).unwrap();
             assert!(matches!(r, BreakerOutcome::Passed(_)));
@@ -10859,17 +10976,15 @@ mod tests {
         assert!(!cfg.is_frozen);
         assert_eq!(cfg.window_start, t0, "window_start anchored to FIRST settle in window");
     }
-    
+
     #[test]
     fn cumulative_settles_exceeding_cap_trip_breaker() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         let t0: i64 = 1_700_000_000;
-        
         let r1 = simulate_outflow_check(&mut cfg, t0, 45_000_000_000).unwrap();
         assert_eq!(r1, BreakerOutcome::Passed(45_000_000_000));
         assert_eq!(cfg.window_outflow, 45_000_000_000);
         assert!(!cfg.is_frozen);
-        
         let r2 = simulate_outflow_check(&mut cfg, t0 + 30, 6_000_000_000).unwrap();
         assert_eq!(r2, BreakerOutcome::Tripped,
             "trip must return Ok(Tripped) so the is_frozen write persists");
@@ -10878,7 +10993,7 @@ mod tests {
         assert_eq!(cfg.window_outflow, 45_000_000_000,
             "tripped attempt MUST NOT advance window_outflow");
     }
-    
+
     #[test]
     fn window_rollover_resets_counter() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
@@ -10886,25 +11001,23 @@ mod tests {
         let r1 = simulate_outflow_check(&mut cfg, t0, 30_000_000_000).unwrap();
         assert!(matches!(r1, BreakerOutcome::Passed(_)));
         assert_eq!(cfg.window_outflow, 30_000_000_000);
-        
+
         let t1 = t0 + DEFAULT_SETTLE_WINDOW_SECONDS as i64 + 1;
         let r2 = simulate_outflow_check(&mut cfg, t1, 30_000_000_000).unwrap();
         assert!(matches!(r2, BreakerOutcome::Passed(_)));
-        
         assert_eq!(cfg.window_outflow, 30_000_000_000);
         assert_eq!(cfg.window_start, t1, "new window anchored at the post-rollover settle");
     }
-    
+
     #[test]
     fn post_trip_settle_reverts_with_vault_frozen() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         cfg.is_frozen = true;
-        
         let would_revert = cfg.is_frozen;
         assert!(would_revert,
             "frozen vault must revert with VaultFrozen — NOT OutflowCircuitBreakerTripped");
     }
-    
+
     #[test]
     fn admin_unfreeze_does_not_reset_counter() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
@@ -10912,14 +11025,13 @@ mod tests {
         cfg.window_start = t0;
         cfg.window_outflow = 49_000_000_000;
         cfg.is_frozen = true;
-        
         cfg.is_frozen = false;
         assert!(!cfg.is_frozen);
         assert_eq!(cfg.window_outflow, 49_000_000_000,
             "unfreeze MUST NOT reset window_outflow (intentional — same window still in force)");
         assert_eq!(cfg.window_start, t0, "unfreeze MUST NOT reset window_start");
     }
-    
+
     #[test]
     fn admin_unfreeze_plus_window_rollover_starts_fresh() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
@@ -10927,34 +11039,28 @@ mod tests {
         cfg.window_start = t0;
         cfg.window_outflow = 49_000_000_000;
         cfg.is_frozen = true;
-        
         cfg.is_frozen = false;
-        
         let t1 = t0 + DEFAULT_SETTLE_WINDOW_SECONDS as i64 + 100;
-        
         let r = simulate_outflow_check(&mut cfg, t1, 20_000_000_000).unwrap();
         assert_eq!(r, BreakerOutcome::Passed(20_000_000_000));
         assert_eq!(cfg.window_outflow, 20_000_000_000);
         assert_eq!(cfg.window_start, t1);
     }
-    
+
     #[test]
     fn admin_unfreeze_after_trip_works() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
-        
         cfg.is_frozen = true;
-        
         cfg.is_frozen = false;
         assert!(!cfg.is_frozen);
     }
-    
-    
+
+
     #[test]
     fn propose_max_settle_per_window_stores_pending_and_unlocks_at() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         let now: i64 = 1_700_000_000;
         let new_value: u64 = 75_000_000_000;
-        
         assert!(new_value >= MIN_MAX_SETTLE_PER_WINDOW);
         cfg.pending_max_settle_per_window = new_value;
         cfg.pending_max_settle_per_window_unlocks_at = now + ADMIN_TIMELOCK_SECONDS;
@@ -10964,7 +11070,7 @@ mod tests {
         assert_eq!(cfg.max_settle_per_window, DEFAULT_MAX_SETTLE_PER_WINDOW,
             "live field unchanged until finalize");
     }
-    
+
     #[test]
     fn propose_max_settle_per_window_below_minimum_rejected() {
         let too_low: u64 = MIN_MAX_SETTLE_PER_WINDOW - 1;
@@ -10972,7 +11078,7 @@ mod tests {
         assert!(would_revert,
             "below-minimum proposals must revert with WindowCapBelowMinimum");
     }
-    
+
     #[test]
     fn finalize_max_settle_per_window_commits_after_72h() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
@@ -10980,11 +11086,8 @@ mod tests {
         cfg.pending_max_settle_per_window = 100_000_000_000;
         cfg.pending_max_settle_per_window_unlocks_at = now0 + ADMIN_TIMELOCK_SECONDS;
         let now1 = now0 + ADMIN_TIMELOCK_SECONDS + 1;
-        
         assert!(cfg.pending_max_settle_per_window_unlocks_at != 0);
-        
         assert!(now1 >= cfg.pending_max_settle_per_window_unlocks_at);
-        
         cfg.max_settle_per_window = cfg.pending_max_settle_per_window;
         cfg.pending_max_settle_per_window = 0;
         cfg.pending_max_settle_per_window_unlocks_at = 0;
@@ -10992,7 +11095,7 @@ mod tests {
         assert_eq!(cfg.pending_max_settle_per_window, 0);
         assert_eq!(cfg.pending_max_settle_per_window_unlocks_at, 0);
     }
-    
+
     #[test]
     fn finalize_max_settle_per_window_before_unlock_reverts() {
         let now: i64 = 1_700_000_000;
@@ -11000,14 +11103,13 @@ mod tests {
         let would_revert = now < unlocks_at;
         assert!(would_revert);
     }
-    
+
     #[test]
     fn cancel_pending_max_settle_per_window() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         cfg.pending_max_settle_per_window = 100_000_000_000;
         cfg.pending_max_settle_per_window_unlocks_at = 1_700_000_000;
         let live_before = cfg.max_settle_per_window;
-        
         cfg.pending_max_settle_per_window = 0;
         cfg.pending_max_settle_per_window_unlocks_at = 0;
         assert_eq!(cfg.pending_max_settle_per_window, 0);
@@ -11015,35 +11117,33 @@ mod tests {
         assert_eq!(cfg.max_settle_per_window, live_before,
             "cancel must NOT touch the live field");
     }
-    
+
     #[test]
     fn finalize_max_settle_per_window_no_pending_reverts() {
-        let unlocks_at: i64 = 0; 
+        let unlocks_at: i64 = 0;
         let would_revert = unlocks_at == 0;
         assert!(would_revert,
             "unlocks_at == 0 is the NothingPending sentinel");
     }
-    
-    
+
+
     #[test]
     fn propose_finalize_settle_window_seconds_72h_path() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         let now0: i64 = 1_700_000_000;
-        let new_value: u32 = 600; 
+        let new_value: u32 = 600;
         assert!(new_value >= MIN_SETTLE_WINDOW_SECONDS
             && new_value <= MAX_SETTLE_WINDOW_SECONDS);
         cfg.pending_settle_window_seconds = new_value;
         cfg.pending_settle_window_seconds_unlocks_at = now0 + ADMIN_TIMELOCK_SECONDS;
-        
         let now1 = now0 + ADMIN_TIMELOCK_SECONDS + 1;
         assert!(now1 >= cfg.pending_settle_window_seconds_unlocks_at);
-        
         cfg.settle_window_seconds = cfg.pending_settle_window_seconds;
         cfg.pending_settle_window_seconds = 0;
         cfg.pending_settle_window_seconds_unlocks_at = 0;
         assert_eq!(cfg.settle_window_seconds, 600);
     }
-    
+
     #[test]
     fn propose_settle_window_seconds_out_of_range_rejected() {
         let too_short: u32 = MIN_SETTLE_WINDOW_SECONDS - 1;
@@ -11056,60 +11156,53 @@ mod tests {
             && too_long <= MAX_SETTLE_WINDOW_SECONDS);
         assert!(would_revert_long);
     }
-    
-    
+
+
     #[test]
     fn integer_overflow_guard_on_window_outflow() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
-        cfg.max_settle_per_window = u64::MAX; 
+        cfg.max_settle_per_window = u64::MAX;
         cfg.window_outflow = u64::MAX;
         cfg.window_start = 1_700_000_000;
-        
         let r = simulate_outflow_check(&mut cfg, 1_700_000_000 + 1, 1);
         assert!(r.is_err(),
             "overflow on window_outflow accumulator must revert with MathOverflow");
     }
-    
+
     #[test]
     fn two_vaults_isolated_one_trips_other_unaffected() {
         let mut cfg_a = minimal_vault_config(Pubkey::new_unique());
         let mut cfg_b = minimal_vault_config(Pubkey::new_unique());
         let t0: i64 = 1_700_000_000;
-        
         let ra = simulate_outflow_check(&mut cfg_a, t0, 60_000_000_000).unwrap();
         assert_eq!(ra, BreakerOutcome::Tripped);
         assert!(cfg_a.is_frozen);
-        
         assert!(!cfg_b.is_frozen);
         assert_eq!(cfg_b.window_outflow, 0);
-        
         let rb = simulate_outflow_check(&mut cfg_b, t0, 10_000_000_000).unwrap();
         assert!(matches!(rb, BreakerOutcome::Passed(_)));
         assert!(!cfg_b.is_frozen);
     }
-    
+
     #[test]
     fn settle_exactly_at_cap_passes() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         let t0: i64 = 1_700_000_000;
-        let amount = cfg.max_settle_per_window; 
+        let amount = cfg.max_settle_per_window;
         let r = simulate_outflow_check(&mut cfg, t0, amount).unwrap();
         assert_eq!(r, BreakerOutcome::Passed(amount),
             "amount == cap must pass (strict > comparator)");
         assert_eq!(cfg.window_outflow, amount);
         assert!(!cfg.is_frozen);
-        
         let r2 = simulate_outflow_check(&mut cfg, t0 + 1, 1).unwrap();
         assert_eq!(r2, BreakerOutcome::Tripped);
         assert!(cfg.is_frozen);
-        
         assert_eq!(cfg.window_outflow, amount,
             "tripped attempt MUST NOT pollute window_outflow");
     }
-    
+
     #[test]
     fn auto_frozen_event_field_shape() {
-        
         let evt = AutoFrozenOnOutflow {
             source: AUTO_FROZEN_SOURCE_LP,
             attempted_amount: 6_000_000_000,
@@ -11124,7 +11217,7 @@ mod tests {
         assert_eq!(evt.threshold, 50_000_000_000);
         assert_eq!(evt.window_start, 1_700_000_000);
         assert_eq!(evt.tripped_at, 1_700_000_120);
-        
+
         let evt_promo = AutoFrozenOnOutflow {
             source: AUTO_FROZEN_SOURCE_PROMO,
             attempted_amount: 1_000_000,
@@ -11137,20 +11230,19 @@ mod tests {
         assert_ne!(evt.source, evt_promo.source,
             "LP and promo trip events must carry distinct source discriminators");
     }
-    
+
     #[test]
     fn cancel_max_settle_per_window_clears_both_pending_fields() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         cfg.pending_max_settle_per_window = 999;
         cfg.pending_max_settle_per_window_unlocks_at = 1_700_000_000;
-        
         cfg.pending_max_settle_per_window = 0;
         cfg.pending_max_settle_per_window_unlocks_at = 0;
         assert_eq!(cfg.pending_max_settle_per_window, 0);
         assert_eq!(cfg.pending_max_settle_per_window_unlocks_at, 0,
             "cancel must zero the unlocks_at sentinel — NothingPending guard depends on it");
     }
-    
+
     #[test]
     fn chip_credit_from_vault_contains_outflow_breaker_regression() {
         let src = include_str!("lib.rs");
@@ -11168,8 +11260,6 @@ mod tests {
             "chip_credit_from_vault MUST return Ok(()) on trip (not err!) so \
              is_frozen=true write persists past the TX (Anchor 0.32 rolls back \
              account state on Err)");
-        
-        
         let trip_block_start = body.find("if projected_outflow > config.max_settle_per_window")
             .expect("trip-check branch must exist");
         let trip_block_end = body[trip_block_start..].find("\n        }")
@@ -11180,23 +11270,17 @@ mod tests {
             "trip branch MUST NOT return err!(OutflowCircuitBreakerTripped) — \
              post-refactor uses Ok return so is_frozen write persists");
     }
+
     #[test]
     fn vault_config_len_includes_breaker_fields() {
-        
-        
-        
         assert_eq!(VaultConfig::LEN, 847);
     }
-    
-    
 
-    
-    
+
     #[test]
     fn cap_exceeded_returns_ok_not_err() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         let t0: i64 = 1_700_000_000;
-        
         let amount = cfg.max_settle_per_window + 1;
         let res = simulate_outflow_check(&mut cfg, t0, amount);
         assert!(res.is_ok(),
@@ -11206,10 +11290,6 @@ mod tests {
         assert_eq!(res.unwrap(), BreakerOutcome::Tripped);
     }
 
-    
-    
-    
-    
     #[test]
     fn cap_exceeded_persists_is_frozen_true() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
@@ -11223,14 +11303,11 @@ mod tests {
              whole point of the refactor — caller MUST be able to re-fetch \
              and see is_frozen == true.");
     }
-    
-    
-    
+
     #[test]
     fn cap_exceeded_does_not_advance_window_outflow() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         let t0: i64 = 1_700_000_000;
-        
         let r1 = simulate_outflow_check(&mut cfg, t0, 45_000_000_000).unwrap();
         assert_eq!(r1, BreakerOutcome::Passed(45_000_000_000));
         assert_eq!(cfg.window_outflow, 45_000_000_000);
@@ -11242,16 +11319,9 @@ mod tests {
              counter is polluted by failed attempts and the next legitimate \
              caller post-unfreeze sees a wrong baseline.");
     }
-    
-    
-    
-    
-    
-    
+
     #[test]
     fn cap_exceeded_emits_auto_frozen_on_outflow_with_correct_fields() {
-        
-        
         let attempted_amount: u64 = 6_000_000_000;
         let pre_attempt_outflow: u64 = 45_000_000_000;
         let threshold: u64 = 50_000_000_000;
@@ -11275,14 +11345,10 @@ mod tests {
         assert_eq!(evt.threshold, threshold);
         assert_eq!(evt.window_start, window_start);
         assert_eq!(evt.tripped_at, tripped_at);
-        
-        
         let projected = evt.attempted_amount + evt.window_outflow_at_trip;
         assert!(projected > evt.threshold,
             "evt math invariant: attempted + window_outflow_at_trip > threshold");
 
-        
-        
         let src = include_str!("lib.rs");
         let start = src.find("pub fn chip_credit_from_vault(")
             .expect("handler must exist");
@@ -11295,9 +11361,6 @@ mod tests {
              pre-attempt counter (NOT projected_outflow)");
     }
 
-    
-    
-    
     #[test]
     fn subsequent_settle_after_auto_freeze_reverts_with_vault_frozen() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
@@ -11306,21 +11369,16 @@ mod tests {
         let r1 = simulate_outflow_check(&mut cfg, t0, cap + 1).unwrap();
         assert_eq!(r1, BreakerOutcome::Tripped);
         assert!(cfg.is_frozen, "trip set is_frozen=true");
-        
-        
         let frozen_guard_would_fire = cfg.is_frozen;
         assert!(frozen_guard_would_fire,
             "next chip_credit_from_vault TX must revert with VaultFrozen BEFORE \
              reaching the breaker math — graceful DoS, NOT silent retry of trip.");
     }
-    
-    
-    
+
     #[test]
     fn admin_unfreeze_after_auto_freeze_allows_next_settle() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         let t0: i64 = 1_700_000_000;
-        
         let cap = cfg.max_settle_per_window;
         let r1 = simulate_outflow_check(&mut cfg, t0, cap + 1).unwrap();
         assert_eq!(r1, BreakerOutcome::Tripped);
@@ -11334,13 +11392,10 @@ mod tests {
         assert_eq!(cfg.window_outflow, 10_000_000_000);
         assert_eq!(cfg.window_start, t1);
     }
-    
-    
-    
+
     #[test]
     fn cap_exceeded_with_paused_vault_still_pauses_first() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
-        
         cfg.is_frozen = true;
         let would_revert_on_frozen = cfg.is_frozen;
         assert!(would_revert_on_frozen,
@@ -11351,28 +11406,13 @@ mod tests {
         assert!(cfg.is_frozen, "frozen must dominate paused for chip_credit");
     }
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     #[test]
     fn trip_path_contains_structured_breaker_trip_log() {
         let src = include_str!("lib.rs");
 
-        
         {
             let start = src.find("pub fn chip_credit_from_vault(")
                 .expect("chip_credit_from_vault handler must exist");
-            
             let trip_start = src[start..].find("if projected_outflow > config.max_settle_per_window")
                 .map(|i| start + i)
                 .expect("LP trip branch must exist in handler");
@@ -11394,7 +11434,6 @@ mod tests {
                     "LP trip msg!() MUST contain field marker `{}`", field
                 );
             }
-            
             let msg_pos = trip.find("BREAKER_TRIP:AutoFrozenOnOutflow")
                 .expect("msg!() with BREAKER_TRIP must exist (asserted above)");
             let is_frozen_pos = trip.find("config.is_frozen = true")
@@ -11405,7 +11444,6 @@ mod tests {
                  — order matters: TX logs survive whole-TX revert but state writes \
                  do not"
             );
-            
             let emit_pos = trip.find("emit!(AutoFrozenOnOutflow")
                 .expect("trip path must emit AutoFrozenOnOutflow event");
             assert!(
@@ -11415,7 +11453,6 @@ mod tests {
             );
         }
 
-        
         {
             let start = src.find("pub fn chip_credit_from_vault_promo(")
                 .expect("chip_credit_from_vault_promo handler must exist");
@@ -11444,7 +11481,6 @@ mod tests {
                 "Promo trip msg!() MUST pass AUTO_FROZEN_SOURCE_PROMO as source byte \
                  (Sentinel uses source byte to disambiguate LP vs promo paths)"
             );
-            
             let msg_pos = trip.find("BREAKER_TRIP:AutoFrozenOnOutflow")
                 .expect("msg!() with BREAKER_TRIP must exist (promo)");
             let is_frozen_pos = trip.find("config.is_frozen = true")
@@ -11456,25 +11492,13 @@ mod tests {
         }
     }
 
-    
-    
-    
-    
-    
 
-    
     #[test]
     fn credit_receipt_len_is_ten() {
         assert_eq!(CreditReceipt::LEN, 10);
         assert_eq!(CreditReceipt::LEN, 8 + 1 + 1);
     }
 
-    
-    
-    
-    
-    
-    
     #[test]
     fn credit_handlers_contain_idempotency_latch_in_cei_order() {
         let src = include_str!("lib.rs");
@@ -11501,12 +11525,6 @@ mod tests {
             let latch = body
                 .find("r.credited = true")
                 .unwrap_or_else(|| panic!("{name} MUST set the credited latch"));
-            
-            
-            
-            
-            
-            
             let transfer = body
                 .rfind("token::transfer_checked")
                 .unwrap_or_else(|| panic!("{name} MUST transfer via transfer_checked"));
@@ -11524,9 +11542,6 @@ mod tests {
                  on a trip or the legit post-unfreeze retry would dup-revert and \
                  the player's win would be lost"
             );
-            
-            
-            
             let undercap = body
                 .find("config.window_outflow = projected_outflow")
                 .unwrap_or_else(|| panic!("{name} MUST commit window_outflow on the under-cap path"));
@@ -11538,9 +11553,6 @@ mod tests {
         }
     }
 
-    
-    
-    
     #[test]
     fn credit_receipt_seed_prefixes_are_distinct() {
         let src = include_str!("lib.rs");
@@ -11554,13 +11566,6 @@ mod tests {
         );
     }
 
-    
-    
-    
-    
-    
-    
-    
     #[test]
     fn promo_ngr_credit_receipts_have_operator_gated_close() {
         let src = include_str!("lib.rs");
@@ -11595,21 +11600,13 @@ mod tests {
         }
     }
 
-    
 
-    
     #[test]
     fn debit_receipt_len_is_ten() {
         assert_eq!(DebitReceipt::LEN, 10);
         assert_eq!(DebitReceipt::LEN, 8 + 1 + 1);
     }
 
-    
-    
-    
-    
-    
-    
     #[test]
     fn debit_handler_contains_idempotency_latch_in_cei_order() {
         let src = include_str!("lib.rs");
@@ -11618,6 +11615,7 @@ mod tests {
         let rel = start + sig.len();
         let end = src[rel..].find("\n    pub fn ").map(|i| rel + i).expect("drift-gate: bound marker absent - re-anchor (would else scan into the include_str! test module)");
         let body = &src[start..end];
+
         assert!(
             body.contains("ProviderVaultError::DuplicateDebit"),
             "chip_debit_to_vault MUST revert DuplicateDebit on a replayed reference"
@@ -11641,34 +11639,16 @@ mod tests {
             "debit path must seed DebitReceipt with prefix b\"debit_receipt\""
         );
     }
-    
-    
-    
-    
-    
-    
 
-    
-    
+
     #[test]
     fn withdraw_receipt_len_is_ten() {
         assert_eq!(WithdrawReceipt::LEN, 10);
         assert_eq!(WithdrawReceipt::LEN, 8 + 1 + 1);
-        
         assert_eq!(WithdrawReceipt::LEN, DebitReceipt::LEN);
         assert_eq!(WithdrawReceipt::LEN, CreditReceipt::LEN);
     }
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     #[test]
     fn withdraw_handler_contains_idempotency_latch_in_cei_order() {
         let src = include_str!("lib.rs");
@@ -11699,20 +11679,12 @@ mod tests {
             "withdraw latch MUST come AFTER the balance/guard checks so a guard \
              failure (InsufficientShares / frozen / auth) leaves the withdraw retryable"
         );
-        
-        
-        
         assert!(
             body.contains("ProviderVaultError::VaultFrozen"),
             "withdraw MUST keep the is_frozen emergency-halt guard"
         );
     }
 
-    
-    
-    
-    
-    
     #[test]
     fn withdraw_receipt_seeded_on_reference_with_distinct_prefix() {
         let src = include_str!("lib.rs");
@@ -11721,13 +11693,10 @@ mod tests {
             "withdraw path must seed WithdrawReceipt with the DISTINCT prefix b\"withdraw_receipt\" \
              (keyed on the caller's `reference`, so distinct references ⇒ distinct PDAs)"
         );
-        
         assert_ne!("withdraw_receipt", "debit_receipt");
         assert_ne!("withdraw_receipt", "credit_receipt");
         assert_ne!("withdraw_receipt", "credit_receipt_promo");
         assert_ne!("withdraw_receipt", "credit_receipt_ngr");
-        
-        
         let cstart = src
             .find("pub struct ChipWithdraw<'info> {")
             .expect("ChipWithdraw context must exist");
@@ -11740,15 +11709,12 @@ mod tests {
             cbody.contains("pub system_program: Program<'info, System>"),
             "ChipWithdraw MUST carry system_program for the init_if_needed"
         );
-        
         assert!(
             src.contains("#[instruction(asset_mint: Pubkey, amount: u64, reference: [u8; 32])]"),
             "ChipWithdraw #[instruction] MUST surface `reference` for the receipt seed"
         );
     }
-    
-    
-    
+
     #[test]
     fn withdraw_receipt_has_operator_gated_close() {
         let src = include_str!("lib.rs");
@@ -11772,10 +11738,7 @@ mod tests {
         );
     }
 
-    
 
-    
-    
     #[test]
     fn register_asset_zero_inits_ngr_counters() {
         let src = include_str!("lib.rs");
@@ -11788,10 +11751,6 @@ mod tests {
         }
     }
 
-    
-    
-    
-    
     #[test]
     fn ngr_promo_handler_shape() {
         let src = include_str!("lib.rs");
@@ -11800,6 +11759,7 @@ mod tests {
         let rel = start + sig.len();
         let end = src[rel..].find("\n    pub fn ").map(|i| rel + i).expect("drift-gate: bound marker absent - re-anchor (would else scan into the include_str! test module)");
         let body = &src[start..end];
+
         assert!(body.contains("config.max_settle_per_window"), "MUST carry the outflow breaker");
         assert!(
             body.contains("require_earmark_invariant(pool, post_balance)"),
@@ -11813,7 +11773,6 @@ mod tests {
         );
         assert!(body.contains("pool.network_reimbursement_owed"), "MUST bump network_reimbursement_owed");
         let latch = body.find("r.credited = true").expect("latch");
-        
         let transfer = body.rfind("token::transfer_checked").expect("transfer");
         assert!(latch < transfer, "latch MUST precede the PAYOUT transfer (CEI)");
         assert!(
@@ -11821,11 +11780,7 @@ mod tests {
             "ngr-promo must seed CreditReceipt with prefix b\"credit_receipt_ngr\""
         );
     }
-    
-    
-    
-    
-    
+
     #[test]
     fn ngr_counters_excluded_from_sum_earmarks() {
         let baseline = sum_earmarks(&fresh_pool(Pubkey::new_unique()));
@@ -11840,53 +11795,43 @@ mod tests {
         );
     }
 
-    
 
-    
-    
-    
-    
     #[test]
     fn accrue_earmarks_nets_promo_from_cascade_not_provider_fee() {
         let net = 1_000_000_000i64;
         let fee = 100_000_000u64;
         let promo = 200_000_000u64;
+
         let mut base = fresh_pool(Pubkey::new_unique());
         accrue_earmarks(&mut base, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, 0).unwrap();
         let mut netted = fresh_pool(Pubkey::new_unique());
         accrue_earmarks(&mut netted, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, promo).unwrap();
+
         assert_eq!(netted.pending_provider_fee, base.pending_provider_fee, "provider_fee MUST stay GROSS");
         assert_eq!(netted.pending_provider_fee, fee, "provider_fee == fee_due (GROSS)");
 
-        
         let after_provider = (net as u64) - fee;
         let bps = DEFAULT_DEV_FEE_BPS as u128;
         assert_eq!(base.pending_dev_fee, (after_provider as u128 * bps / 10_000) as u64);
         assert_eq!(netted.pending_dev_fee, ((after_provider - promo) as u128 * bps / 10_000) as u64);
         assert!(netted.pending_dev_fee < base.pending_dev_fee, "dev_fee shrinks with promo netting");
 
-        
         let base_total =
             base.pending_dev_fee + base.pending_sovereign + base.pending_yield + base.pending_reserve;
         let net_total =
             netted.pending_dev_fee + netted.pending_sovereign + netted.pending_yield + netted.pending_reserve;
         assert!(net_total < base_total, "the promo-netted cascade earmark total is strictly smaller");
     }
-    
-    
-    
-    
-    
-    
+
     #[test]
     fn pv_ngr_01_reimbursable_promo_nets_zero_at_submit_conserves_earmarks() {
-        let net = 1_000_000_000i64; 
-        let fee = 100_000_000u64; 
-        let after_provider = (net as u64) - fee; 
+        let net = 1_000_000_000i64;
+        let fee = 100_000_000u64;
+        let after_provider = (net as u64) - fee;
 
-        
         let mut baseline = fresh_pool(Pubkey::new_unique());
         accrue_earmarks(&mut baseline, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+
         let r: u64 = 300_000_000;
         let mut pool = fresh_pool(Pubkey::new_unique());
         pool.promo_paid_unreconciled = r;
@@ -11896,15 +11841,12 @@ mod tests {
         assert_eq!(promo_to_net, 0, "a purely-reimbursable promo nets ZERO at submit");
         accrue_earmarks(&mut pool, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, promo_to_net).unwrap();
 
-        
         assert_eq!(pool.pending_dev_fee, baseline.pending_dev_fee, "dev_fee conserved");
         assert_eq!(pool.pending_sovereign, baseline.pending_sovereign, "sovereign conserved");
         assert_eq!(pool.pending_yield, baseline.pending_yield, "yield conserved");
         assert_eq!(pool.pending_reserve, baseline.pending_reserve, "reserve conserved");
         assert_eq!(pool.pending_provider_fee, baseline.pending_provider_fee, "provider_fee conserved (GROSS)");
 
-        
-        
         let mut mixed = fresh_pool(Pubkey::new_unique());
         mixed.promo_paid_unreconciled = 500_000_000;
         mixed.network_reimbursement_owed = 300_000_000;
@@ -11912,10 +11854,6 @@ mod tests {
         assert_eq!(own_mixed, 200_000_000, "only the OWN slice (paid − reimbursable) is netted");
     }
 
-    
-    
-    
-    
     #[test]
     fn pv_ngr_01_submit_and_settle_source_shape() {
         let src = include_str!("lib.rs");
@@ -11925,7 +11863,6 @@ mod tests {
             let end = src[rel..].find("\n    pub fn ").map(|i| rel + i).expect("drift-gate: bound marker absent - re-anchor (would else scan into the include_str! test module)");
             &src[start..end]
         };
-        
         let submit = body_of("pub fn submit_provider_ggr(");
         assert!(
             submit.contains("let own_promo_unreconciled = pool")
@@ -11936,8 +11873,6 @@ mod tests {
             submit.contains("let promo_to_net = own_promo_unreconciled.min(after_provider_for_net)"),
             "promo_to_net MUST clamp own_promo to the post-provider base"
         );
-        
-        
         assert!(
             submit.contains("let affiliate_to_net = pool.affiliate_unreconciled.min(remaining_base)"),
             "submit MUST net affiliate from the remaining base (AFFIL-NGR World 2)"
@@ -11947,7 +11882,6 @@ mod tests {
                 && submit.contains(".checked_sub(affiliate_to_net)"),
             "submit MUST consume the netted affiliate slice from affiliate_unreconciled"
         );
-        
         let settle = body_of("pub fn settle_provider_invoice(");
         assert!(
             settle.contains("let reimbursable_reconciled = pool.network_reimbursement_owed"),
@@ -11960,8 +11894,6 @@ mod tests {
         );
     }
 
-    
-    
     #[test]
     fn accrue_earmarks_rejects_promo_exceeding_base() {
         let net = 1_000_000_000i64;
@@ -11978,7 +11910,6 @@ mod tests {
         );
     }
 
-    
     #[test]
     fn accrue_earmarks_negative_receipt_requires_zero_promo() {
         let mut p1 = fresh_pool(Pubkey::new_unique());
@@ -11993,14 +11924,7 @@ mod tests {
         );
     }
 
-    
 
-    
-    
-    
-    
-    
-    
     #[test]
     fn settle_provider_invoice_has_reimbursement_addback() {
         let src = include_str!("lib.rs");
@@ -12009,6 +11933,7 @@ mod tests {
         let rel = start + sig.len();
         let end = src[rel..].find("\n    pub fn ").map(|i| rel + i).expect("drift-gate: bound marker absent - re-anchor (would else scan into the include_str! test module)");
         let body = &src[start..end];
+
         assert!(body.contains("let credit_avail"), "MUST compute credit_avail (credit-first netting)");
         assert!(body.contains("let reimb_applied"), "MUST compute reimb_applied");
         assert!(body.contains("pool.provider_credit"), "MUST consume/carry provider_credit");
@@ -12018,7 +11943,6 @@ mod tests {
             body.contains(".checked_sub(amount)"),
             "MUST discharge the FULL invoice (provider_owed_total -= amount) — the add-back"
         );
-        
         assert!(body.contains("if pay_pp > 0"), "MUST skip the transfer when pay_pp == 0");
         assert!(
             body.contains("token::transfer_checked(cpi, pay_pp"),
@@ -12029,16 +11953,7 @@ mod tests {
         assert!(net_pos < pay_pos, "reimbursement netting MUST precede the transfer");
     }
 
-    
-    
-    
-    
-    
 
-    
-    
-    
-    
     #[test]
     fn promo_asset_pool_len_unchanged_at_524() {
         assert_eq!(
@@ -12047,24 +11962,19 @@ mod tests {
         );
     }
 
-    
-    
 
-    
     #[test]
     fn rule45_constants_match_spec() {
         assert_eq!(CIRCUIT_YELLOW_NAV_PCT_OF_PEAK, 20);
         assert_eq!(CIRCUIT_RED_NAV_PCT_OF_PEAK, 10);
         assert_eq!(INSURANCE_FLOOR_PCT_OF_NAV, 5);
         assert_eq!(WAIVER_MAX_TOTAL_SECONDS, 72 * 60 * 60);
-        
         assert!(WAIVER_MAX_TOTAL_SECONDS > WAIVER_DELAY_SECONDS);
     }
-    
+
     #[test]
     fn recompute_fresh_vault_stays_green() {
         let mut p = fresh_pool(Pubkey::new_unique());
-        
         let s = recompute_circuit_state(&mut p, 0, 1_000).unwrap();
         assert_eq!(s, CIRCUIT_GREEN);
         assert_eq!(p.circuit_state, CIRCUIT_GREEN);
@@ -12072,13 +11982,11 @@ mod tests {
         assert_eq!(s2, CIRCUIT_YELLOW, "no-insurance vault is YELLOW until floor funded");
         assert_eq!(p.peak_vault, 10_000_000_000, "peak is NAV-based and set on first deposit");
         assert_eq!(p.peak_vault_at, 1_001);
-        
         p.insurance_balance = 500_000_000;
         let s3 = recompute_circuit_state(&mut p, 10_000_000_000, 1_002).unwrap();
         assert_eq!(s3, CIRCUIT_GREEN, "funding the insurance floor clears YELLOW");
     }
 
-    
     #[test]
     fn recompute_peak_is_nav_based_and_monotone_up() {
         let mut p = fresh_pool(Pubkey::new_unique());
@@ -12088,37 +11996,26 @@ mod tests {
         assert_eq!(p.peak_vault, 100_000_000_000, "peak must not ratchet down");
         p.pending_yield = 10_000_000_000;
         recompute_circuit_state(&mut p, 120_000_000_000, 30).unwrap();
-        
         assert_eq!(p.peak_vault, 110_000_000_000);
     }
 
-    
-    
     #[test]
     fn pv_r45_m01_transient_deposit_yellow_recovers_via_peak_reset() {
         let mut p = fresh_pool(Pubkey::new_unique());
-        
         p.insurance_balance = 1_000_000_000;
         let s0 = recompute_circuit_state(&mut p, 10_000_000_000, 10).unwrap();
         assert_eq!(s0, CIRCUIT_GREEN, "baseline healthy vault is GREEN");
         assert_eq!(p.peak_vault, 10_000_000_000);
 
-        
-        
         recompute_circuit_state(&mut p, 100_000_000_000, 20).unwrap();
         assert_eq!(p.peak_vault, 100_000_000_000, "peak ratchets up on the big deposit");
 
-        
-        
         let s_pinned = recompute_circuit_state(&mut p, 10_000_000_000, 30).unwrap();
         assert_eq!(
             s_pinned, CIRCUIT_YELLOW,
             "transient-deposit peak inflation pins YELLOW — the DoS the fix targets"
         );
 
-        
-        
-        
         let proposed_peak = 10_000_000_000u64;
         p.peak_vault = proposed_peak;
         let s_recovered = recompute_circuit_state(&mut p, 10_000_000_000, 40).unwrap();
@@ -12127,19 +12024,15 @@ mod tests {
             "re-anchoring peak to current NAV clears the spurious YELLOW → waterfall resumes"
         );
 
-        
-        
         let s_real = recompute_circuit_state(&mut p, 1_000_000_000, 50).unwrap();
         assert_eq!(
             s_real, CIRCUIT_YELLOW,
             "a genuine post-reset drawdown still trips the breaker (H-03 preserved)"
         );
     }
-    
-    
+
     #[test]
     fn pv_r45_m01_reset_peak_timelock_and_sentinel() {
-        
         assert_eq!(ADMIN_TIMELOCK_SECONDS, 72 * 60 * 60);
         let p = fresh_pool(Pubkey::new_unique());
         assert_eq!(
@@ -12147,49 +12040,39 @@ mod tests {
             "no reset proposal in flight on a fresh pool (sentinel == 0)"
         );
         assert_eq!(p.pending_reset_peak, 0);
-        
         let now = 1_000_000i64;
         let unlocks_at = now + ADMIN_TIMELOCK_SECONDS;
         assert!(now < unlocks_at, "finalize blocked until 72h elapses");
         assert!(now + ADMIN_TIMELOCK_SECONDS >= unlocks_at, "finalize permitted at/after unlock");
     }
 
-    
     #[test]
     fn recompute_trips_yellow_on_nav_below_20pct() {
         let mut p = fresh_pool(Pubkey::new_unique());
-        
-        
         recompute_circuit_state(&mut p, 100_000_000_000, 10).unwrap();
-        p.insurance_balance = 100_000_000_000; 
+        p.insurance_balance = 100_000_000_000;
         let s = recompute_circuit_state(&mut p, 19_000_000_000, 20).unwrap();
         assert_eq!(s, CIRCUIT_YELLOW);
-        
         let s2 = recompute_circuit_state(&mut p, 20_000_000_000, 30).unwrap();
         assert_eq!(s2, CIRCUIT_GREEN);
     }
 
-    
     #[test]
     fn recompute_trips_yellow_on_insurance_below_5pct() {
         let mut p = fresh_pool(Pubkey::new_unique());
         recompute_circuit_state(&mut p, 100_000_000_000, 10).unwrap();
-        
         p.insurance_balance = 4_999_999_999;
         let s = recompute_circuit_state(&mut p, 100_000_000_000, 20).unwrap();
         assert_eq!(s, CIRCUIT_YELLOW);
-        
         p.insurance_balance = 5_000_000_000;
         let s2 = recompute_circuit_state(&mut p, 100_000_000_000, 30).unwrap();
         assert_eq!(s2, CIRCUIT_GREEN);
     }
 
-    
     #[test]
     fn recompute_red_requires_nav_below_10pct_and_zero_insurance() {
         let mut p = fresh_pool(Pubkey::new_unique());
         recompute_circuit_state(&mut p, 100_000_000_000, 10).unwrap();
-        
         p.insurance_balance = 1;
         let s = recompute_circuit_state(&mut p, 9_000_000_000, 20).unwrap();
         assert_eq!(s, CIRCUIT_YELLOW, "any insurance keeps it out of RED");
@@ -12206,12 +12089,10 @@ mod tests {
     fn recompute_leaving_red_clears_waiver() {
         let mut p = fresh_pool(Pubkey::new_unique());
         recompute_circuit_state(&mut p, 100_000_000_000, 10).unwrap();
-        
         p.insurance_balance = 0;
         recompute_circuit_state(&mut p, 5_000_000_000, 100).unwrap();
         assert_eq!(p.circuit_state, CIRCUIT_RED);
         assert_ne!(p.waiver_max_until, 0);
-        
         p.insurance_balance = 100_000_000_000;
         let s = recompute_circuit_state(&mut p, 100_000_000_000, 200).unwrap();
         assert_eq!(s, CIRCUIT_GREEN);
@@ -12221,7 +12102,6 @@ mod tests {
         assert!(!p.waiver_active);
     }
 
-    
     #[test]
     fn withdrawal_cooldown_waived_truth_table() {
         let mut p = fresh_pool(Pubkey::new_unique());
@@ -12230,22 +12110,17 @@ mod tests {
         assert!(!withdrawal_cooldown_waived(&p, 1_000));
         p.circuit_state = CIRCUIT_YELLOW;
         assert!(!withdrawal_cooldown_waived(&p, 1_000));
-        
         p.circuit_state = CIRCUIT_RED;
         p.waiver_max_until = 1_000;
         assert!(!withdrawal_cooldown_waived(&p, 999));
-        
         assert!(withdrawal_cooldown_waived(&p, 1_000));
         assert!(withdrawal_cooldown_waived(&p, 5_000));
-        
         p.waiver_max_until = 0;
         assert!(!withdrawal_cooldown_waived(&p, 10_000));
     }
 
-    
     #[test]
     fn insurance_draw_zero_when_above_floor() {
-        
         let holder = HARD_VAULT_FLOOR_USDC + 1_000_000_000;
         let draw = compute_insurance_draw(holder, 10_000_000, 0, 50_000_000_000).unwrap();
         assert_eq!(draw, 0);
@@ -12253,19 +12128,16 @@ mod tests {
 
     #[test]
     fn insurance_draw_covers_shortfall_against_hard_floor() {
-        
         let credit = 100_000_000u64;
-        let holder = HARD_VAULT_FLOOR_USDC + credit - 5; 
+        let holder = HARD_VAULT_FLOOR_USDC + credit - 5;
         let draw = compute_insurance_draw(holder, credit, 0, 1_000_000_000).unwrap();
         assert_eq!(draw, 5);
     }
 
     #[test]
     fn insurance_draw_uses_earmarks_as_floor_when_higher() {
-        
         let earmarks = HARD_VAULT_FLOOR_USDC + 10_000_000_000;
         let credit = 50_000_000u64;
-        
         let holder = earmarks + credit - 7;
         let draw = compute_insurance_draw(holder, credit, earmarks, 1_000_000_000).unwrap();
         assert_eq!(draw, 7);
@@ -12273,7 +12145,6 @@ mod tests {
 
     #[test]
     fn insurance_draw_capped_at_available_insurance() {
-        
         let credit = 1_000_000u64;
         let holder = credit;
         let draw = compute_insurance_draw(holder, credit, 0, 3).unwrap();
@@ -12282,19 +12153,15 @@ mod tests {
 
     #[test]
     fn insurance_draw_credit_exceeding_holder_is_overflow() {
-        
         let err = compute_insurance_draw(10, 11, 0, 1_000).unwrap_err();
-        
         assert!(format!("{err:?}").contains("MathOverflow") || true);
     }
 
-    
     #[test]
     fn waiver_instructions_present_with_guards() {
         let src = include_str!("lib.rs");
         assert!(src.contains("pub fn cancel_waiver("), "cancel_waiver instruction must exist");
         assert!(src.contains("pub fn extend_waiver("), "extend_waiver instruction must exist");
-        
         let cw = src.find("pub fn cancel_waiver(").unwrap();
         let cw_end = src[cw..].find("\n    pub fn ").map(|i| cw + i).unwrap();
         assert!(src[cw..cw_end].contains("WaiverNotRed"), "cancel_waiver must require RED");
@@ -12305,8 +12172,6 @@ mod tests {
         assert!(src[ew..ew_end].contains("WaiverExtensionTooLong"), "extend_waiver must enforce the 72h cap");
     }
 
-    
-    
     #[test]
     fn rule45_gates_present_in_handlers() {
         let src = include_str!("lib.rs");
@@ -12344,19 +12209,108 @@ mod tests {
                 "{sig} MUST carry the RED-gate"
             );
             assert!(b.contains("CircuitBreakerRed"), "{sig} MUST use CircuitBreakerRed");
-            
             assert!(b.contains("compute_insurance_draw("), "{sig} MUST attempt the insurance draw");
             assert!(b.contains("recompute_circuit_state("), "{sig} MUST recompute the breaker at the end");
         }
     }
 
-    
+    #[test]
+    fn drains_advance_hwm_on_every_path() {
+        let src = include_str!("lib.rs");
+        let body_of = |sig: &str| -> &str {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} must exist"));
+            let rel = start + sig.len();
+            let end = src[rel..]
+                .find("\n    pub fn ")
+                .map(|i| rel + i)
+                .expect("drift-gate: bound marker absent - re-anchor");
+            &src[start..end]
+        };
+        for sig in [
+            "pub fn distribute_affiliate(",
+            "pub fn distribute_sovereign(",
+            "pub fn distribute_yield(",
+            "pub fn distribute_reserve(",
+            "pub fn distribute_dev_fee(",
+            "pub fn distribute_ggr(",
+        ] {
+            let b = body_of(sig);
+            assert!(
+                b.contains("advance_hwm_on_drain(pool)"),
+                "{sig} MUST advance the HWM via advance_hwm_on_drain(pool) — without it a \
+                 post-drain loss/recovery round trip re-earmarks already-distributed profit"
+            );
+            assert!(
+                !b.contains("last_distributed_gross_ggr = pool.cumulative_gross_ggr"),
+                "{sig} MUST NOT assign the HWM directly — use advance_hwm_on_drain(pool) \
+                 so the max() cannot be dropped"
+            );
+        }
+        let ggr = body_of("pub fn distribute_ggr(");
+        let skip_end = ggr
+            .find("return Ok(());")
+            .expect("drift-gate: distribute_ggr skip branch early-return absent");
+        assert!(
+            !ggr[..skip_end].contains("advance_hwm_on_drain"),
+            "distribute_ggr's SKIP branch MUST NOT advance the HWM — advancing there \
+             permanently forgives an un-swept delta"
+        );
+
+        let guard_pat = concat!("require!(amount > 0, ProviderVaultError::", "NothingToDrain);");
+        let advance_pat = concat!("advance_hwm_on_drain", "(pool);");
+        let drain_guards = src.matches(guard_pat).count();
+        let advances = src.matches(advance_pat).count();
+        assert!(
+            drain_guards >= 5,
+            "drift-gate: expected at least the 5 known NothingToDrain guards, found {drain_guards} \
+             — the guard's formatting changed; re-anchor this pattern before trusting the count"
+        );
+        assert_eq!(
+            advances,
+            drain_guards + 1,
+            "HWM advance count ({advances}) must equal the number of drains ({drain_guards}) + 1 \
+             for distribute_ggr's success branch. A NEW distribute_* that omits \
+             advance_hwm_on_drain(pool) lands here even though it is absent from the signature \
+             list above — add the call (and the signature) rather than adjusting this count."
+        );
+    }
+
+    #[test]
+    fn drains_carry_operator_or_keeper_authority_gate() {
+        let src = include_str!("lib.rs");
+        let body_of = |sig: &str| -> &str {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} must exist"));
+            let rel = start + sig.len();
+            let end = src[rel..]
+                .find("\n    pub fn ")
+                .map(|i| rel + i)
+                .expect("drift-gate: bound marker absent - re-anchor");
+            &src[start..end]
+        };
+        for sig in [
+            "pub fn distribute_affiliate(",
+            "pub fn distribute_sovereign(",
+            "pub fn distribute_yield(",
+            "pub fn distribute_reserve(",
+            "pub fn distribute_dev_fee(",
+        ] {
+            let b = body_of(sig);
+            assert!(
+                b.contains("is_operator || is_keeper_eligible"),
+                "{sig} MUST gate on operator OR the 8-day keeper window"
+            );
+            assert!(
+                b.contains("ProviderVaultError::Unauthorized"),
+                "{sig} MUST reject an ungated caller with Unauthorized"
+            );
+        }
+    }
+
     #[test]
     fn promo_sum_earmarks_includes_pending_promo() {
         let mut p = fresh_pool(Pubkey::new_unique());
-        p.pending_promo = 1_500_000_000; 
+        p.pending_promo = 1_500_000_000;
         assert_eq!(sum_earmarks(&p), 1_500_000_000);
-        
         p.pending_dev_fee = 1;
         p.pending_provider_fee = 2;
         p.pending_affiliate = 4;
@@ -12365,13 +12319,10 @@ mod tests {
         p.pending_reserve = 32;
         assert_eq!(sum_earmarks(&p), 1_500_000_000 + 63);
     }
-    
-    
-    
+
     #[test]
     fn promo_nav_basis_excludes_pending_promo() {
         let mut p = fresh_pool(Pubkey::new_unique());
-        
         p.pending_promo = 3_000_000_000;
         let holder_balance: u64 = 10_000_000_000;
         let nav = nav_basis(&p, holder_balance).unwrap();
@@ -12379,8 +12330,7 @@ mod tests {
             "NAV MUST exclude pending_promo — LPs do not capture ops' marketing \
              budget as price appreciation");
     }
-    
-    
+
     #[test]
     fn promo_earmark_invariant_fails_when_balance_lt_promo() {
         let mut p = fresh_pool(Pubkey::new_unique());
@@ -12389,8 +12339,6 @@ mod tests {
         assert!(r.is_err(), "K4 MUST trip when balance < promo earmark");
     }
 
-    
-    
     #[test]
     fn promo_earmark_invariant_passes_at_exact_equality() {
         let mut p = fresh_pool(Pubkey::new_unique());
@@ -12398,99 +12346,78 @@ mod tests {
         let r = require_earmark_invariant(&p, 1_000_000_000);
         assert!(r.is_ok(), "K4 invariant uses >=, not > — exact equality is valid");
     }
-    
-    
+
     #[test]
     fn promo_top_up_increments_pending_promo() {
         let mut p = fresh_pool(Pubkey::new_unique());
         let pre = p.pending_promo;
-        let amount: u64 = 5_000_000_000; 
+        let amount: u64 = 5_000_000_000;
         p.pending_promo = p.pending_promo.checked_add(amount).unwrap();
         assert_eq!(p.pending_promo, pre + amount);
         assert_eq!(p.pending_promo, 5_000_000_000);
     }
-    
-    
-    
+
     #[test]
     fn promo_credit_decrements_pending_promo() {
         let mut p = fresh_pool(Pubkey::new_unique());
         p.pending_promo = 5_000_000_000;
         let amount: u64 = 1_500_000_000;
-        
-        
         assert!(p.pending_promo >= amount);
         p.pending_promo = p.pending_promo.checked_sub(amount).unwrap();
         assert_eq!(p.pending_promo, 3_500_000_000);
     }
 
-    
-    
     #[test]
     fn promo_credit_rejects_when_underfunded() {
         let p = fresh_pool(Pubkey::new_unique());
-        
         assert_eq!(p.pending_promo, 0);
         let amount: u64 = 1_000_000_000;
-        
         let would_revert = p.pending_promo < amount;
         assert!(would_revert,
             "Handler MUST revert PromoPoolUnderfunded when pool < requested payout");
     }
 
-    
     #[test]
     fn promo_lifecycle_topup_then_credit_residual_correct() {
         let mut p = fresh_pool(Pubkey::new_unique());
-        
         let topup: u64 = 10_000_000_000;
         p.pending_promo = p.pending_promo.checked_add(topup).unwrap();
         assert_eq!(p.pending_promo, 10_000_000_000);
-        
         let win_a: u64 = 2_400_000_000;
         p.pending_promo = p.pending_promo.checked_sub(win_a).unwrap();
-        
         let win_b: u64 = 750_000_000;
         p.pending_promo = p.pending_promo.checked_sub(win_b).unwrap();
-        
         assert_eq!(p.pending_promo, 6_850_000_000);
     }
 
-    
     #[test]
     fn promo_top_up_overflow_guard() {
         let mut p = fresh_pool(Pubkey::new_unique());
         p.pending_promo = u64::MAX - 100;
-        
         let attempt = p.pending_promo.checked_add(200);
         assert!(attempt.is_none(),
             "checked_add MUST return None on overflow — handler maps to MathOverflow");
     }
 
-    
-    
-    
     #[test]
     fn promo_top_up_preserves_k4_invariant() {
         let mut p = fresh_pool(Pubkey::new_unique());
         p.pending_yield = 1_000_000_000;
         let vault_pre: u64 = 1_000_000_000;
         assert!(require_earmark_invariant(&p, vault_pre).is_ok());
-        
         let topup: u64 = 5_000_000_000;
         p.pending_promo = topup;
         let vault_post: u64 = vault_pre + topup;
         assert!(require_earmark_invariant(&p, vault_post).is_ok(),
             "K4 must hold post-top-up — both sides grow by N");
     }
-    
+
     #[test]
     fn promo_credit_preserves_k4_invariant() {
         let mut p = fresh_pool(Pubkey::new_unique());
         p.pending_promo = 5_000_000_000;
         let vault_pre: u64 = 5_000_000_000;
         assert!(require_earmark_invariant(&p, vault_pre).is_ok());
-        
         let payout: u64 = 1_200_000_000;
         p.pending_promo = p.pending_promo.checked_sub(payout).unwrap();
         let vault_post: u64 = vault_pre - payout;
@@ -12498,10 +12425,6 @@ mod tests {
             "K4 must hold post-credit — both sides shrink by N");
     }
 
-    
-    
-    
-    
     #[test]
     fn promo_credit_handler_uses_cei_ordering() {
         let src = include_str!("lib.rs");
@@ -12520,10 +12443,6 @@ mod tests {
              token::transfer_checked CPI. Founder lock 2026-05-22.");
     }
 
-    
-    
-    
-    
     #[test]
     fn promo_credit_handler_contains_outflow_breaker() {
         let src = include_str!("lib.rs");
@@ -12540,6 +12459,7 @@ mod tests {
         assert!(body.contains("config.is_frozen = true"),
             "chip_credit_from_vault_promo MUST set is_frozen=true on trip");
     }
+
     #[test]
     fn promo_top_up_handler_freeze_gate_asymmetric() {
         let src = include_str!("lib.rs");
@@ -12556,40 +12476,20 @@ mod tests {
              (LP deposits, promo top-ups) are intentionally allowed during \
              soft pause so ops can fund recovery operations");
     }
-    
-    
-    
-    
-    
-    
-    
-    
 
-    
-    
-    
-    
-    
+
     #[test]
     fn c2_f02_nav_invariance_across_flush() {
         let mut p = fresh_pool(Pubkey::new_unique());
         p.pending_provider_fee = 100_000_000;
         p.pending_promo = 50_000_000;
-        
         let holder_balance: u64 = 1_000_000_000;
         let nav_before = nav_basis(&p, holder_balance).unwrap();
         assert_eq!(nav_before, 850_000_000,
             "NAV_before = vault - sum_earmarks = $1000 - $100 - $50 = $850");
-        
-        
-        
-        
         let flush_amount: u64 = 100_000_000;
         p.pending_provider_fee = p.pending_provider_fee.checked_sub(flush_amount).unwrap();
         p.provider_owed_total = p.provider_owed_total.checked_add(flush_amount).unwrap();
-        
-        
-        
         let nav_after = nav_basis(&p, holder_balance).unwrap();
         assert_eq!(nav_after, nav_before,
             "C2-F02: NAV MUST be invariant across flush_provider_fee. Pre-fix \
@@ -12599,13 +12499,6 @@ mod tests {
             "NAV_after MUST still equal $850 — funds are committed but in vault");
     }
 
-    
-    
-    
-    
-    
-    
-    
     #[test]
     fn c2_f02_nav_invariance_across_full_lifecycle() {
         let mut p = fresh_pool(Pubkey::new_unique());
@@ -12614,6 +12507,7 @@ mod tests {
         let mut holder_balance: u64 = 1_000_000_000;
         let nav_t0 = nav_basis(&p, holder_balance).unwrap();
         assert_eq!(nav_t0, 850_000_000);
+
         let amount: u64 = 100_000_000;
         p.pending_provider_fee = p.pending_provider_fee.checked_sub(amount).unwrap();
         p.provider_owed_total = p.provider_owed_total.checked_add(amount).unwrap();
@@ -12621,9 +12515,6 @@ mod tests {
         assert_eq!(nav_t1, nav_t0,
             "NAV invariant across flush (T0 → T1)");
 
-        
-        
-        
         p.provider_owed_total = p.provider_owed_total.checked_sub(amount).unwrap();
         holder_balance = holder_balance.checked_sub(amount).unwrap();
         let nav_t2 = nav_basis(&p, holder_balance).unwrap();
@@ -12636,22 +12527,11 @@ mod tests {
         assert_eq!(nav_t2, 850_000_000,
             "Final NAV: $1000 - $100 (drained) - $50 (promo) = $850");
 
-        
-        
-        
-        
         assert!(require_earmark_invariant(&p, holder_balance).is_ok(),
             "K4 invariant must hold post-settle");
     }
 
-    
-    
-    
-    
-    
-    
-    
-    
+
     #[test]
     fn rotate_pause_authority_pending_defaults_clear() {
         let cfg = minimal_vault_config(Pubkey::new_unique());
@@ -12661,14 +12541,12 @@ mod tests {
 
     #[test]
     fn propose_then_finalize_succeeds_after_window() {
-        
         let admin = Pubkey::new_unique();
         let new_auth = Pubkey::new_unique();
         let mut cfg = minimal_vault_config(admin);
-        cfg.pause_authority = Pubkey::new_unique(); 
+        cfg.pause_authority = Pubkey::new_unique();
         let now: i64 = 1_700_000_000;
 
-        
         assert!(new_auth != admin, "distinctness invariant");
         assert!(new_auth != Pubkey::default(), "non-default invariant");
         assert_eq!(cfg.pending_pause_authority_unlocks_at, 0,
@@ -12678,7 +12556,6 @@ mod tests {
         cfg.pending_pause_authority_unlocks_at = unlocks_at;
         assert_eq!(unlocks_at - now, 259_200);
 
-        
         let finalize_now = unlocks_at + 1;
         assert!(finalize_now >= cfg.pending_pause_authority_unlocks_at);
         assert!(cfg.pending_pause_authority != cfg.authority,
@@ -12688,9 +12565,9 @@ mod tests {
         cfg.pending_pause_authority_unlocks_at = 0;
         assert_eq!(cfg.pause_authority, new_auth);
     }
+
     #[test]
     fn finalize_before_window_reverts_timelock_not_elapsed() {
-        
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
         let now: i64 = 1_700_000_000;
         let new_auth = Pubkey::new_unique();
@@ -12698,12 +12575,12 @@ mod tests {
         cfg.pending_pause_authority = new_auth;
         cfg.pending_pause_authority_unlocks_at = unlocks_at;
 
-        
         let almost = unlocks_at - 1;
         assert!(almost < cfg.pending_pause_authority_unlocks_at);
 
         assert!(unlocks_at >= cfg.pending_pause_authority_unlocks_at);
     }
+
     #[test]
     fn cancel_clears_pending() {
         let mut cfg = minimal_vault_config(Pubkey::new_unique());
@@ -12719,34 +12596,19 @@ mod tests {
 
     #[test]
     fn propose_rejects_default_pubkey_and_admin_match() {
-        
-        
-        
         let admin = Pubkey::new_unique();
         let cfg = minimal_vault_config(admin);
 
-        
         let default_pk = Pubkey::default();
         assert_eq!(default_pk, Pubkey::default(),
             "propose rejects default pubkey");
 
-        
         let new_eq_admin = admin;
         assert_eq!(new_eq_admin, cfg.authority,
             "propose rejects distinctness violation");
     }
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+
+
     #[test]
     fn test_propose_rotate_operator_happy_path() {
         let admin = Pubkey::new_unique();
@@ -12756,7 +12618,6 @@ mod tests {
         cfg.operator_pubkey = current_operator;
         let now: i64 = 1_700_000_000;
 
-        
         assert_eq!(cfg.pending_operator_pubkey, Pubkey::default(),
             "no proposal active");
         assert_eq!(cfg.pending_operator_unlocks_at, 0,
@@ -12767,46 +12628,38 @@ mod tests {
         cfg.pending_operator_pubkey = new_operator;
         cfg.pending_operator_unlocks_at = unlocks_at;
 
-        
         assert_eq!(unlocks_at - now, 259_200);
         assert_eq!(cfg.pending_operator_pubkey, new_operator);
         assert_eq!(cfg.operator_pubkey, current_operator,
             "operator_pubkey must NOT change at propose time");
     }
 
-    
-    
     #[test]
     fn test_propose_rotate_operator_unauthorized() {
         let admin = Pubkey::new_unique();
         let attacker = Pubkey::new_unique();
         let cfg = minimal_vault_config(admin);
 
-        
         let admin_passes = admin == cfg.authority;
         let attacker_passes = attacker == cfg.authority;
         assert!(admin_passes, "admin must pass authority check");
         assert!(!attacker_passes, "attacker MUST fail authority check → Unauthorized");
     }
-    
-    
+
     #[test]
     fn test_propose_rotate_operator_default_sentinel_rejected() {
         let admin = Pubkey::new_unique();
         let _cfg = minimal_vault_config(admin);
-        
+
         let default_op = Pubkey::default();
         assert_eq!(default_op, Pubkey::default(),
             "propose MUST reject Pubkey::default() → InvalidOperator");
 
-        
         let valid_op = Pubkey::new_unique();
         assert!(valid_op != Pubkey::default(),
             "a real pubkey must pass the InvalidOperator gate");
     }
 
-    
-    
     #[test]
     fn test_propose_rotate_operator_duplicate_pending_rejected() {
         let admin = Pubkey::new_unique();
@@ -12814,11 +12667,11 @@ mod tests {
         let second_proposal = Pubkey::new_unique();
         let mut cfg = minimal_vault_config(admin);
         let now: i64 = 1_700_000_000;
+
         let unlocks_at = now.checked_add(ADMIN_TIMELOCK_SECONDS).unwrap();
         cfg.pending_operator_pubkey = first_proposal;
         cfg.pending_operator_unlocks_at = unlocks_at;
 
-        
         let pending_is_default = cfg.pending_operator_pubkey == Pubkey::default();
         assert!(!pending_is_default,
             "second propose MUST revert ProposalAlreadyPending");
@@ -12827,8 +12680,7 @@ mod tests {
             "first proposal must remain — overwrite is rejected");
         assert!(second_proposal != first_proposal, "test sanity");
     }
-    
-    
+
     #[test]
     fn test_finalize_rotate_operator_premature() {
         let admin = Pubkey::new_unique();
@@ -12839,15 +12691,15 @@ mod tests {
         let unlocks_at = now + ADMIN_TIMELOCK_SECONDS;
         cfg.pending_operator_pubkey = new_op;
         cfg.pending_operator_unlocks_at = unlocks_at;
-        
+
         let almost = unlocks_at - 1;
         assert!(almost < cfg.pending_operator_unlocks_at,
             "1s before unlock MUST revert TimelockNotElapsed");
 
-        
         assert!(unlocks_at >= cfg.pending_operator_unlocks_at,
             "T == unlocks_at inclusive boundary passes");
     }
+
     #[test]
     fn test_finalize_rotate_operator_after_72h_succeeds() {
         let admin = Pubkey::new_unique();
@@ -12857,7 +12709,6 @@ mod tests {
         cfg.operator_pubkey = old_op;
         let now: i64 = 1_700_000_000;
 
-        
         let unlocks_at = now + ADMIN_TIMELOCK_SECONDS;
         cfg.pending_operator_pubkey = new_op;
         cfg.pending_operator_unlocks_at = unlocks_at;
@@ -12868,11 +12719,11 @@ mod tests {
         assert!(cfg.pending_operator_pubkey != Pubkey::default(),
             "NoProposalPending gate: a proposal IS pending");
 
-        
         let recorded_old = cfg.operator_pubkey;
         cfg.operator_pubkey = cfg.pending_operator_pubkey;
         cfg.pending_operator_pubkey = Pubkey::default();
         cfg.pending_operator_unlocks_at = 0;
+
         assert_eq!(recorded_old, old_op, "event must capture pre-rotation op");
         assert_eq!(cfg.operator_pubkey, new_op, "operator rotated to new value");
         assert_eq!(cfg.pending_operator_pubkey, Pubkey::default(),
@@ -12881,12 +12732,6 @@ mod tests {
             "unlocks_at cleared after finalize");
     }
 
-    
-    
-    
-    
-    
-    
     #[test]
     fn test_finalize_rotate_operator_unauthorized() {
         let admin = Pubkey::new_unique();
@@ -12894,11 +12739,9 @@ mod tests {
         let new_op = Pubkey::new_unique();
         let mut cfg = minimal_vault_config(admin);
 
-        
-        
         let now: i64 = 1_700_000_000;
         cfg.pending_operator_pubkey = new_op;
-        cfg.pending_operator_unlocks_at = now - 1; 
+        cfg.pending_operator_unlocks_at = now - 1;
         let finalize_now = now;
         assert!(finalize_now >= cfg.pending_operator_unlocks_at, "timelock elapsed gate passes");
         assert!(cfg.pending_operator_pubkey != Pubkey::default(), "NoProposalPending gate passes: proposal IS pending");
@@ -12909,45 +12752,39 @@ mod tests {
         assert!(!attacker_passes, "attacker MUST fail finalize authority check → Unauthorized (AUTH-01)");
     }
 
-    
-    
     #[test]
     fn test_finalize_rotate_operator_no_pending_rejected() {
         let admin = Pubkey::new_unique();
         let cfg = minimal_vault_config(admin);
 
-        
         assert_eq!(cfg.pending_operator_pubkey, Pubkey::default(),
             "no proposal active");
         assert_eq!(cfg.pending_operator_unlocks_at, 0,
             "no proposal active");
+
         let no_proposal = cfg.pending_operator_pubkey == Pubkey::default();
         assert!(no_proposal,
             "finalize without a proposal MUST revert NoProposalPending");
     }
 
-    
-    
     #[test]
     fn test_cancel_propose_operator_rotation() {
         let admin = Pubkey::new_unique();
         let new_op = Pubkey::new_unique();
         let mut cfg = minimal_vault_config(admin);
         let now: i64 = 1_700_000_000;
+
         cfg.pending_operator_pubkey = new_op;
         cfg.pending_operator_unlocks_at = now + ADMIN_TIMELOCK_SECONDS;
 
-        
         assert!(cfg.pending_operator_pubkey != Pubkey::default(),
             "NoProposalPending gate: proposal exists");
 
-        
         let cancelled = cfg.pending_operator_pubkey;
 
-        
         cfg.pending_operator_pubkey = Pubkey::default();
         cfg.pending_operator_unlocks_at = 0;
-        
+
         assert_eq!(cancelled, new_op,
             "event must record the cancelled-proposal pubkey");
         assert_eq!(cfg.pending_operator_pubkey, Pubkey::default(),
@@ -12955,8 +12792,7 @@ mod tests {
         assert_eq!(cfg.pending_operator_unlocks_at, 0,
             "unlocks_at cleared after cancel");
     }
-    
-    
+
     #[test]
     fn test_cancel_propose_operator_rotation_unauthorized() {
         let admin = Pubkey::new_unique();
@@ -12969,15 +12805,17 @@ mod tests {
         assert!(!attacker_passes,
             "attacker MUST fail authority check on cancel → Unauthorized");
     }
+
     #[test]
     fn test_cancel_propose_no_pending_rejected() {
         let admin = Pubkey::new_unique();
         let cfg = minimal_vault_config(admin);
+
         let no_proposal = cfg.pending_operator_pubkey == Pubkey::default();
         assert!(no_proposal,
             "cancel without a proposal MUST revert NoProposalPending");
     }
-    
+
     #[test]
     fn rotate_operator_timelock_is_72h() {
         assert_eq!(ADMIN_TIMELOCK_SECONDS, 72 * 60 * 60,
@@ -12985,8 +12823,6 @@ mod tests {
         assert_eq!(ADMIN_TIMELOCK_SECONDS, 259_200);
     }
 
-    
-    
     #[test]
     fn rotate_operator_pending_defaults_clear() {
         let cfg = minimal_vault_config(Pubkey::new_unique());
@@ -12995,22 +12831,8 @@ mod tests {
         assert_eq!(cfg.pending_operator_unlocks_at, 0,
             "pending_operator_unlocks_at must default to 0 (no proposal sentinel)");
     }
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+
+
     fn fresh_withdraw_request(owner: Pubkey, asset_pool: Pubkey, nonce: u64) -> WithdrawRequest {
         WithdrawRequest {
             owner,
@@ -13026,9 +12848,6 @@ mod tests {
         }
     }
 
-    
-    
-    
     #[test]
     fn test_process_withdraw_request_unauthorized_wallet_reverts() {
         let alice = Pubkey::new_unique();
@@ -13036,39 +12855,30 @@ mod tests {
         let pool = Pubkey::new_unique();
         let request = fresh_withdraw_request(alice, pool, 1);
 
-        
         let constraint_passes = request.owner == bob;
         assert!(!constraint_passes,
             "Bob attempting to process Alice's request MUST fail the wallet/owner constraint → UnauthorizedRequest");
-        
+
         let alice_passes = request.owner == alice;
         assert!(alice_passes, "Alice processing her own request must pass");
     }
 
-    
-    
     #[test]
     fn test_process_withdraw_request_wrong_asset_pool_reverts() {
         let attacker = Pubkey::new_unique();
-        let pool_a = Pubkey::new_unique(); 
-        let pool_b = Pubkey::new_unique(); 
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
         let stale_matured_request = fresh_withdraw_request(attacker, pool_a, 42);
-        
+
         let has_one_passes = stale_matured_request.asset_pool == pool_b;
         assert!(!has_one_passes,
             "passing pool_b's asset_pool with a pool_a request MUST fail has_one → AssetMismatch");
 
-        
-        
-        
         let seed_anchor_matches = stale_matured_request.asset_pool == pool_b;
         assert!(!seed_anchor_matches,
             "seeds-derivation backstop: pool_b-derived seeds cannot match a pool_a PDA");
     }
 
-    
-    
-    
     #[test]
     fn test_cancel_withdraw_request_unauthorized_wallet_reverts() {
         let alice = Pubkey::new_unique();
@@ -13076,15 +12886,12 @@ mod tests {
         let pool = Pubkey::new_unique();
         let request = fresh_withdraw_request(alice, pool, 7);
 
-        
         let constraint_passes = request.owner == bob;
         assert!(!constraint_passes,
             "Bob attempting to cancel Alice's request MUST fail constraint → UnauthorizedRequest \
              (closes the close=wallet rent-theft vector; ~0.002 SOL × N requests at scale)");
     }
 
-    
-    
     #[test]
     fn test_cancel_withdraw_request_wrong_asset_pool_reverts() {
         let attacker = Pubkey::new_unique();
@@ -13092,18 +12899,15 @@ mod tests {
         let pool_b = Pubkey::new_unique();
         let request = fresh_withdraw_request(attacker, pool_a, 99);
 
-        
-        
         let wallet_constraint_passes = request.owner == attacker;
         assert!(wallet_constraint_passes,
             "attacker IS the owner; wallet constraint allows the call to reach has_one");
+
         let has_one_passes = request.asset_pool == pool_b;
         assert!(!has_one_passes,
             "pool_b passed for a pool_a request MUST fail has_one → AssetMismatch");
     }
 
-    
-    
     #[test]
     fn test_process_withdraw_request_correct_binding_succeeds() {
         let alice = Pubkey::new_unique();
@@ -13118,9 +12922,6 @@ mod tests {
             "asset_pool arg matches request.asset_pool → has_one passes");
     }
 
-    
-    
-    
     #[test]
     fn test_cancel_withdraw_request_correct_binding_succeeds() {
         let alice = Pubkey::new_unique();
@@ -13135,21 +12936,11 @@ mod tests {
             "asset_pool arg matches request.asset_pool → has_one passes");
     }
 
-    
-    
-    
-    
-    
 
     fn rl_admin() -> Pubkey { Pubkey::new_unique() }
 
     #[test]
     fn test_propose_rate_limit_escalation_full_ladder() {
-        
-        
-        
-        
-        
         let mut config = minimal_vault_config(rl_admin());
         let t0: i64 = 1_700_000_000;
 
@@ -13170,8 +12961,6 @@ mod tests {
         check_and_record_propose(&mut config, t5).unwrap();
         assert_eq!(config.propose_cooldown_until, t5 + 86_400, "5th: 24h");
 
-        
-        
         let now_7d_rung = t0 + 100_000;
         config.recent_proposes = [
             now_7d_rung - 80_000,
@@ -13197,7 +12986,6 @@ mod tests {
         check_and_record_propose(&mut config, t0).unwrap();
         check_and_record_propose(&mut config, t0 + 1).unwrap();
         check_and_record_propose(&mut config, t0 + 2).unwrap();
-        
         let early = t0 + 2 + 1;
         let err = check_and_record_propose(&mut config, early).unwrap_err();
         if let anchor_lang::error::Error::AnchorError(ae) = err {
@@ -13215,7 +13003,6 @@ mod tests {
             panic!("expected AnchorError, got {err:?}");
         }
 
-        
         let on_boundary = config.propose_cooldown_until;
         check_and_record_propose(&mut config, on_boundary).unwrap();
     }
@@ -13228,6 +13015,7 @@ mod tests {
         check_and_record_propose(&mut config, t0 + 1).unwrap();
         check_and_record_propose(&mut config, t0 + 2).unwrap();
         assert!(config.propose_cooldown_until > 0);
+
         let t_future = t0 + 2 + 86_400 + 100;
         check_and_record_propose(&mut config, t_future).unwrap();
         assert_eq!(config.propose_cooldown_until, 0,
@@ -13260,11 +13048,6 @@ mod tests {
 
     #[test]
     fn test_propose_rate_limit_compromised_key_scenario() {
-        
-        
-        
-        
-        
         let mut config = minimal_vault_config(rl_admin());
         let t0: i64 = 1_700_000_000;
         let mut landed = 0usize;
@@ -13286,8 +13069,6 @@ mod tests {
             landed <= 20,
             "rate-limit must cap lands in 72h under hostile pressure (observed {landed}, expected ≤ 20)"
         );
-        
-        
         assert!(
             landed < 864 / 40,
             "rate-limit must achieve ≥ 40× reduction vs unlimited spam (864/{} = {} ≥ {})",
@@ -13299,45 +13080,28 @@ mod tests {
 
     #[test]
     fn test_propose_rate_limit_len_growth() {
-        
-        
-        
         assert_eq!(VaultConfig::LEN, 847);
     }
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+
+
+
     #[test]
     fn fb_test_a_founder_seed_grants_seat_1() {
-        
         let founder = Pubkey::new_unique();
         let mut config = minimal_vault_config(Pubkey::new_unique());
         config.founder_pubkey = founder;
         config.vault_seeded = false;
         config.founding_banker_counter = 0;
+
         let mut position = fresh_lp_position(0, 0);
         position.holder = founder;
         let amount = FOUNDING_BANKER_MIN_USDC_MICRO;
         let now: i64 = 1_700_000_000;
 
-        
         assert!(!position.is_founding_banker);
         assert!(config.founding_banker_counter < FOUNDING_BANKER_MAX_SEATS);
         assert!(amount >= FOUNDING_BANKER_MIN_USDC_MICRO);
 
-        
         config.founding_banker_counter += 1;
         position.is_founding_banker = true;
         position.founding_banker_seat_number = config.founding_banker_counter;
@@ -13353,43 +13117,33 @@ mod tests {
 
     #[test]
     fn fb_test_a_21_seats_fill_in_order_22nd_skipped() {
-        
-        
-        
-        
         let mut config = minimal_vault_config(Pubkey::new_unique());
         config.founder_pubkey = Pubkey::new_unique();
-        
         config.founding_banker_counter = FOUNDING_BANKER_MAX_SEATS;
         config.vault_seeded = true;
 
         let mut position_22nd = fresh_lp_position(0, 0);
         let amount = FOUNDING_BANKER_MIN_USDC_MICRO;
 
-        
         let would_grant = !position_22nd.is_founding_banker
             && config.founding_banker_counter < FOUNDING_BANKER_MAX_SEATS
             && amount >= FOUNDING_BANKER_MIN_USDC_MICRO;
         assert!(!would_grant, "22nd depositor at $5k must NOT receive an FB seat (cap = 21)");
 
-        
         assert_eq!(config.founding_banker_counter, FOUNDING_BANKER_MAX_SEATS);
-        
         assert!(!position_22nd.is_founding_banker);
         assert_eq!(position_22nd.founding_banker_seat_number, 0);
     }
 
     #[test]
     fn fb_test_a_below_5k_min_no_grant() {
-        
-        
         let mut config = minimal_vault_config(Pubkey::new_unique());
         config.founder_pubkey = Pubkey::new_unique();
-        config.founding_banker_counter = 1; 
+        config.founding_banker_counter = 1;
         config.vault_seeded = true;
 
         let position = fresh_lp_position(0, 0);
-        let amount: u64 = FOUNDING_BANKER_MIN_USDC_MICRO - 1; 
+        let amount: u64 = FOUNDING_BANKER_MIN_USDC_MICRO - 1;
 
         let would_grant = !position.is_founding_banker
             && config.founding_banker_counter < FOUNDING_BANKER_MAX_SEATS
@@ -13397,13 +13151,13 @@ mod tests {
         assert!(!would_grant, "Deposit below $5k must NOT receive an FB seat");
         assert_eq!(config.founding_banker_counter, 1, "Counter must not change");
     }
+
     #[test]
     fn fb_test_a_existing_fb_no_double_grant() {
-        
-        
         let mut config = minimal_vault_config(Pubkey::new_unique());
         config.founding_banker_counter = 5;
         config.vault_seeded = true;
+
         let mut position = fresh_lp_position(0, 1_000_000);
         position.is_founding_banker = true;
         position.founding_banker_seat_number = 3;
@@ -13416,12 +13170,12 @@ mod tests {
         assert_eq!(config.founding_banker_counter, 5);
         assert_eq!(position.founding_banker_seat_number, original_seat);
     }
+
+
     #[test]
     fn fb_test_b_full_fb_pool_growth_phase_returns_8500() {
-        
-        
         let mut pool = fresh_pool(Pubkey::new_unique());
-        pool.lp_tokens_by_tier = [100, 0, 0, 0, 0]; 
+        pool.lp_tokens_by_tier = [100, 0, 0, 0, 0];
         let fb_in_window = 100u64;
         assert_eq!(
             compute_weighted_lp_bps(&pool, 1, fb_in_window).unwrap(),
@@ -13431,15 +13185,11 @@ mod tests {
 
     #[test]
     fn fb_test_b_partial_fb_growth_phase_blends() {
-        
         let mut pool = fresh_pool(Pubkey::new_unique());
         pool.lp_tokens_by_tier = [0, 0, 0, 0, 100];
         let fb_in_window = 50u64;
         assert_eq!(compute_weighted_lp_bps(&pool, 1, fb_in_window).unwrap(), 8_500);
 
-        
-        
-        
         let mut pool2 = fresh_pool(Pubkey::new_unique());
         pool2.lp_tokens_by_tier = [100, 0, 0, 0, 0];
         let fb_in_window2 = 50u64;
@@ -13448,36 +13198,27 @@ mod tests {
 
     #[test]
     fn fb_test_b_per_seat_decay_after_90_days() {
-        
-        
-        
-        
-        
-        
         let seat_timestamp: i64 = 1_700_000_000;
+
         let in_window_now = seat_timestamp + 89 * SECONDS_PER_DAY;
         let still_in_window_in =
             in_window_now < seat_timestamp + FOUNDING_BANKER_BONUS_DAYS * SECONDS_PER_DAY;
         assert!(still_in_window_in, "T+89d must be inside the 90-day perk window");
 
-        
         let out_window_now = seat_timestamp + 91 * SECONDS_PER_DAY;
         let still_in_window_out =
             out_window_now < seat_timestamp + FOUNDING_BANKER_BONUS_DAYS * SECONDS_PER_DAY;
         assert!(!still_in_window_out, "T+91d must be OUTSIDE the 90-day perk window");
-        
+
         let mut pool = fresh_pool(Pubkey::new_unique());
-        pool.lp_tokens_by_tier = [100, 0, 0, 0, 0]; 
-        pool.founding_banker_lp_tokens_in_window = 100; 
+        pool.lp_tokens_by_tier = [100, 0, 0, 0, 0];
+        pool.founding_banker_lp_tokens_in_window = 100;
+
         assert_eq!(
             compute_weighted_lp_bps(&pool, 1, pool.founding_banker_lp_tokens_in_window).unwrap(),
             8_500
         );
 
-        
-        
-        
-        
         pool.founding_banker_lp_tokens_in_window = 0;
         assert_eq!(
             compute_weighted_lp_bps(&pool, 1, pool.founding_banker_lp_tokens_in_window).unwrap(),
@@ -13488,38 +13229,25 @@ mod tests {
 
     #[test]
     fn fb_test_b_independent_per_fb_windows() {
-        
-        let early_seat: i64 = 1_700_000_000;             
-        let late_seat: i64 = early_seat + 60 * SECONDS_PER_DAY; 
+        let early_seat: i64 = 1_700_000_000;
+        let late_seat: i64 = early_seat + 60 * SECONDS_PER_DAY;
 
-        
-        
-        
         let now_a = early_seat + 89 * SECONDS_PER_DAY;
         assert!(now_a < early_seat + FOUNDING_BANKER_BONUS_DAYS * SECONDS_PER_DAY);
         assert!(now_a < late_seat + FOUNDING_BANKER_BONUS_DAYS * SECONDS_PER_DAY);
 
-        
-        
-        
         let now_b = early_seat + 95 * SECONDS_PER_DAY;
         assert!(now_b >= early_seat + FOUNDING_BANKER_BONUS_DAYS * SECONDS_PER_DAY);
         assert!(now_b < late_seat + FOUNDING_BANKER_BONUS_DAYS * SECONDS_PER_DAY);
-        
-        
-        
+
         let now_c = early_seat + 155 * SECONDS_PER_DAY;
         assert!(now_c >= early_seat + FOUNDING_BANKER_BONUS_DAYS * SECONDS_PER_DAY);
         assert!(now_c >= late_seat + FOUNDING_BANKER_BONUS_DAYS * SECONDS_PER_DAY);
     }
 
-    
 
     #[test]
     fn fb_test_c_non_founder_first_deposit_rejected() {
-        
-        
-        
         let founder = Pubkey::new_unique();
         let attacker = Pubkey::new_unique();
         let mut config = minimal_vault_config(Pubkey::new_unique());
@@ -13527,7 +13255,6 @@ mod tests {
         config.vault_seeded = false;
         config.founding_banker_counter = 0;
 
-        
         let depositor = attacker;
         let gate_passes = config.vault_seeded || depositor == config.founder_pubkey;
         assert!(!gate_passes, "non-founder must NOT pass the Rule 41 gate");
@@ -13535,9 +13262,6 @@ mod tests {
 
     #[test]
     fn fb_test_c_founder_seeds_then_others_admitted() {
-        
-        
-        
         let founder = Pubkey::new_unique();
         let bob = Pubkey::new_unique();
         let mut config = minimal_vault_config(Pubkey::new_unique());
@@ -13545,16 +13269,15 @@ mod tests {
         config.vault_seeded = false;
         config.founding_banker_counter = 0;
 
-        
         let mut founder_pos = fresh_lp_position(0, 0);
         founder_pos.holder = founder;
         let amount = FOUNDING_BANKER_MIN_USDC_MICRO;
         let now: i64 = 1_700_000_000;
+
         let depositor_a = founder;
         let gate_a = config.vault_seeded || depositor_a == config.founder_pubkey;
         assert!(gate_a, "founder must pass Rule 41 gate");
 
-        
         assert!(amount >= FOUNDING_BANKER_MIN_USDC_MICRO);
         config.founding_banker_counter += 1;
         founder_pos.is_founding_banker = true;
@@ -13571,7 +13294,6 @@ mod tests {
         let gate_b = config.vault_seeded || depositor_b == config.founder_pubkey;
         assert!(gate_b, "post-seed deposit by non-founder must pass Rule 41 gate");
 
-        
         let mut bob_pos = fresh_lp_position(0, 0);
         let bob_amount = FOUNDING_BANKER_MIN_USDC_MICRO;
         let would_grant = !bob_pos.is_founding_banker
@@ -13588,25 +13310,21 @@ mod tests {
 
     #[test]
     fn fb_test_c_founder_seed_below_5k_rejected() {
-        
-        
         let founder = Pubkey::new_unique();
         let mut config = minimal_vault_config(Pubkey::new_unique());
         config.founder_pubkey = founder;
         config.vault_seeded = false;
 
-        let amount: u64 = 4_000_000_000; 
+        let amount: u64 = 4_000_000_000;
         let identity_ok = founder == config.founder_pubkey;
         let amount_ok = amount >= FOUNDING_BANKER_MIN_USDC_MICRO;
         assert!(identity_ok, "founder identity matches");
         assert!(!amount_ok, "founder seed below $5k must fail amount gate");
     }
 
-    
 
     #[test]
     fn fb_test_d_full_withdraw_decrements_counter() {
-        
         let mut config = minimal_vault_config(Pubkey::new_unique());
         config.founding_banker_counter = 21;
 
@@ -13615,11 +13333,9 @@ mod tests {
         position.founding_banker_seat_number = 5;
         position.founding_banker_seat_timestamp = 1_700_000_000;
 
-        
         let burn_amount = position.lp_shares;
         position.lp_shares = position.lp_shares.checked_sub(burn_amount).unwrap();
 
-        
         let post_burn_zero = position.lp_shares == 0;
         let pre_burn_was_fb = position.is_founding_banker;
         if pre_burn_was_fb && post_burn_zero {
@@ -13627,30 +13343,29 @@ mod tests {
         }
 
         assert_eq!(config.founding_banker_counter, 20);
-        
         assert!(position.is_founding_banker);
         assert_eq!(position.founding_banker_seat_number, 5);
-        
         let next_seat_available = config.founding_banker_counter < FOUNDING_BANKER_MAX_SEATS;
         assert!(next_seat_available);
     }
+
     #[test]
     fn fb_test_d_partial_withdraw_keeps_seat() {
-        
-        
         let mut config = minimal_vault_config(Pubkey::new_unique());
         config.founding_banker_counter = 10;
+
         let mut position = fresh_lp_position(2, 1_000_000);
         position.is_founding_banker = true;
         position.founding_banker_seat_number = 3;
 
-        let burn_amount = 500_000u64; 
+        let burn_amount = 500_000u64;
         position.lp_shares = position.lp_shares.checked_sub(burn_amount).unwrap();
 
         let post_burn_zero = position.lp_shares == 0;
         if position.is_founding_banker && post_burn_zero {
             config.founding_banker_counter = config.founding_banker_counter.saturating_sub(1);
         }
+
         assert_eq!(config.founding_banker_counter, 10, "Partial burn must NOT release seat");
         assert!(position.is_founding_banker);
         assert!(position.lp_shares > 0);
@@ -13661,47 +13376,33 @@ mod tests {
         let mut pool = fresh_pool(Pubkey::new_unique());
         pool.lp_tokens_by_tier = [0, 0, 1_000_000, 0, 0];
         pool.founding_banker_lp_tokens_in_window = 1_000_000;
+
         let burn = 400_000u64;
         pool.founding_banker_lp_tokens_in_window = pool
             .founding_banker_lp_tokens_in_window
             .saturating_sub(burn);
         assert_eq!(pool.founding_banker_lp_tokens_in_window, 600_000);
 
-        
         let burn2 = 600_000u64;
         pool.founding_banker_lp_tokens_in_window = pool
             .founding_banker_lp_tokens_in_window
             .saturating_sub(burn2);
         assert_eq!(pool.founding_banker_lp_tokens_in_window, 0);
 
-        
-        pool.lp_tokens_by_tier = [0, 0, 600_000, 0, 0]; 
+        pool.lp_tokens_by_tier = [0, 0, 600_000, 0, 0];
         assert_eq!(compute_weighted_lp_bps(&pool, 1, 0).unwrap(), 7_500);
     }
 
-    
 
     #[test]
     fn fb_constants_match_originals_vault() {
-        
-        
         assert_eq!(FOUNDING_BANKER_MAX_SEATS, 21, "Rule 37");
         assert_eq!(FOUNDING_BANKER_MIN_USDC_MICRO, 5_000_000_000, "Rule 38");
         assert_eq!(FOUNDING_BANKER_BONUS_DAYS, 90, "Rule 40a");
         assert_eq!(FOUNDING_BANKER_LP_SHARE_BPS, 8_500, "85% LP-share perk");
     }
 
-    
-    
-    
 
-    
-    
-    
-    
-    
-    
-    
     fn drift_handler_end(src: &str, idx: usize) -> usize {
         src[idx + 1..]
             .find("\n    pub fn ")
@@ -13713,7 +13414,6 @@ mod tests {
         include_str!("lib.rs")
     }
 
-    
 
     #[test]
     fn deprecated_set_reserve_burn_mode_reverts_with_err() {
@@ -13725,8 +13425,6 @@ mod tests {
         assert!(body.contains("err!(ProviderVaultError::InstructionDeprecated)"),
             "set_reserve_burn_mode MUST hard-revert with InstructionDeprecated (M-CRIT-02). \
              Source excerpt:\n{}", body);
-        
-        
         assert!(!body.contains("config.reserve_burn_mode = new_mode;"),
             "set_reserve_burn_mode MUST NOT mutate state after the gate (M-CRIT-02). \
              Source excerpt:\n{}", body);
@@ -13734,7 +13432,6 @@ mod tests {
 
     #[test]
     fn set_raydium_graduated_still_works_alongside_deprecated_gate() {
-        
         let src = tlp_provider_vault_lib_rs_source();
         assert!(src.contains("pub fn set_raydium_graduated("),
             "set_raydium_graduated must remain (canonical replacement)");
@@ -13749,11 +13446,9 @@ mod tests {
             "error definition must reference the audit ID for traceability");
     }
 
-    
 
     #[test]
     fn daily_outflow_constants_exist() {
-        
         assert_eq!(DEFAULT_MAX_DAILY_OUTFLOW, 250_000_000_000,
             "Default daily cap = $250k micro-USDC");
         assert_eq!(MIN_MAX_DAILY_OUTFLOW, 50_000_000_000,
@@ -13764,8 +13459,6 @@ mod tests {
 
     #[test]
     fn daily_outflow_default_below_5min_cap_is_blocked() {
-        
-        
         assert!(MIN_MAX_DAILY_OUTFLOW >= DEFAULT_MAX_SETTLE_PER_WINDOW,
             "MIN_MAX_DAILY_OUTFLOW ({}) must be >= 5-min cap ({})",
             MIN_MAX_DAILY_OUTFLOW, DEFAULT_MAX_SETTLE_PER_WINDOW);
@@ -13773,18 +13466,16 @@ mod tests {
 
     #[test]
     fn daily_outflow_under_cap_normal_path() {
-        
         let mut daily_window_outflow: u64 = 0;
         let mut daily_window_start: i64 = 0;
         let max_daily: u64 = DEFAULT_MAX_DAILY_OUTFLOW;
         let now: i64 = 1_700_000_000;
 
-        
         if daily_window_start == 0 || now >= daily_window_start + DAILY_OUTFLOW_WINDOW_SECONDS {
             daily_window_outflow = 0;
             daily_window_start = now;
         }
-        let amount: u64 = 100_000_000_000; 
+        let amount: u64 = 100_000_000_000;
         let projected = daily_window_outflow.checked_add(amount).unwrap();
         assert!(projected <= max_daily, "under-cap path must succeed");
         daily_window_outflow = projected;
@@ -13794,7 +13485,6 @@ mod tests {
 
     #[test]
     fn daily_outflow_breach_triggers_freeze() {
-        
         let daily_window_outflow: u64 = 200_000_000_000;
         let max_daily: u64 = DEFAULT_MAX_DAILY_OUTFLOW;
         let amount: u64 = 100_000_000_000;
@@ -13805,7 +13495,6 @@ mod tests {
 
     #[test]
     fn daily_outflow_window_rollover_resets_counter() {
-        
         let mut daily_window_outflow: u64 = 200_000_000_000;
         let mut daily_window_start: i64 = 1_700_000_000;
         let now_after_rollover: i64 = daily_window_start + DAILY_OUTFLOW_WINDOW_SECONDS;
@@ -13842,7 +13531,6 @@ mod tests {
             "cancel_max_daily_outflow must exist");
     }
 
-    
 
     #[test]
     fn propose_rotate_operator_rejects_authority_collision() {
@@ -13891,7 +13579,6 @@ mod tests {
             "error definition must reference the audit ID for traceability");
     }
 
-    
 
     #[test]
     fn chip_debit_default_cap_constant() {
@@ -13913,7 +13600,7 @@ mod tests {
             debit_window_amount = 0;
             debit_window_start = now;
         }
-        let amount: u64 = 5_000_000_000; 
+        let amount: u64 = 5_000_000_000;
         let projected = debit_window_amount.checked_add(amount).unwrap();
         assert!(projected <= cap, "$5k debit must succeed under $10k cap");
         debit_window_amount = projected;
@@ -13923,7 +13610,6 @@ mod tests {
 
     #[test]
     fn chip_debit_over_cap_reverts() {
-        
         let debit_window_amount: u64 = 8_000_000_000;
         let cap: u64 = DEFAULT_MAX_CHIP_DEBIT_PER_24H_PER_WALLET;
         let amount: u64 = 5_000_000_000;
@@ -13948,29 +13634,24 @@ mod tests {
         let projected = debit_window_amount.checked_add(amount).unwrap();
         let cap: u64 = DEFAULT_MAX_CHIP_DEBIT_PER_24H_PER_WALLET;
         assert!(projected <= cap, "post-rollover $9k debit must succeed");
-        
-        
         assert_eq!(debit_window_start, now_after_rollover,
             "rollover MUST advance debit_window_start to now_after_rollover");
     }
 
     #[test]
     fn chip_debit_per_wallet_isolation() {
-        
-        
         let wallet_a_debit: u64 = DEFAULT_MAX_CHIP_DEBIT_PER_24H_PER_WALLET;
         let wallet_b_debit: u64 = 0;
         let cap: u64 = DEFAULT_MAX_CHIP_DEBIT_PER_24H_PER_WALLET;
 
-        
         let amount: u64 = 5_000_000_000;
         let projected_b = wallet_b_debit.checked_add(amount).unwrap();
         assert!(projected_b <= cap, "wallet B is independent of wallet A");
         assert_eq!(wallet_a_debit, cap, "wallet A is at cap (no spillover)");
     }
+
     #[test]
     fn chip_debit_zero_sentinel_uses_default_cap() {
-        
         let pool_override: u64 = 0;
         let effective_cap = if pool_override == 0 {
             DEFAULT_MAX_CHIP_DEBIT_PER_24H_PER_WALLET
@@ -13978,6 +13659,7 @@ mod tests {
             pool_override
         };
         assert_eq!(effective_cap, DEFAULT_MAX_CHIP_DEBIT_PER_24H_PER_WALLET);
+
         let pool_override: u64 = 25_000_000_000;
         let effective_cap = if pool_override == 0 {
             DEFAULT_MAX_CHIP_DEBIT_PER_24H_PER_WALLET
@@ -13995,6 +13677,7 @@ mod tests {
         assert!(src.contains("M-HIGH-07"),
             "error definition must reference the audit ID for traceability");
     }
+
     #[test]
     fn set_chip_debit_cap_per_wallet_instruction_exists() {
         let src = tlp_provider_vault_lib_rs_source();
@@ -14008,45 +13691,28 @@ mod tests {
 
     #[test]
     fn provider_player_escrow_len_unchanged_with_rate_limit_fields() {
-        
-        
-        
-        
         assert_eq!(ProviderPlayerEscrow::LEN, 8 + 32 + 32 + 8 + 1 + 8 + 8 + 16,
             "ProviderPlayerEscrow LEN must be 113 — rate-limit fields absorbed in reserved, no recorded holder");
         assert_eq!(ProviderPlayerEscrow::LEN, 113,
             "ProviderPlayerEscrow LEN must equal 113 absolute");
     }
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
 
     fn tlp_provider_vault_lib_rs_source_pass2() -> &'static str {
         include_str!("lib.rs")
     }
+
     #[test]
     fn distribute_yield_cpi_passes_usdc_mint_to_swap_router() {
         let src = tlp_provider_vault_lib_rs_source_pass2();
-        
-        
         assert!(
             src.contains("usdc_mint_constraint: ctx.accounts.swap_router_usdc_mint.to_account_info()"),
             "distribute_yield Path B CPI MUST pass swap_router_usdc_mint to RouteProviderYieldUsdc.usdc_mint_constraint (M-HIGH-04 FIX PASS 2)"
         );
-        
         assert!(
             src.contains("pub swap_router_usdc_mint: Box<Account<'info, Mint>>"),
             "DistributeYield MUST expose swap_router_usdc_mint as a typed Mint account (M-HIGH-04 FIX PASS 2)"
         );
-        
         assert!(
             src.contains("address = asset_mint @ ProviderVaultError::AssetMismatch"),
             "swap_router_usdc_mint MUST be pinned with `address = asset_mint` (defense-in-depth alongside swap_router's `address = config.usdc_mint`)"
@@ -14054,9 +13720,6 @@ mod tests {
     }
 
 
-    
-    
-    
     #[test]
     fn propose_rotate_operator_rejects_affiliate_recorder_collision_f6() {
         let src = tlp_provider_vault_lib_rs_source_pass2();
@@ -14070,16 +13733,12 @@ mod tests {
              Source excerpt:\n{}",
             body
         );
-        
-        
         assert!(
             body.contains("ProviderVaultError::OperatorRoleCollision"),
             "F6: affiliate_recorder collision MUST emit OperatorRoleCollision for SIEM consistency"
         );
     }
 
-    
-    
     #[test]
     fn propose_rotate_pause_authority_rejects_affiliate_recorder_collision_f6() {
         let src = tlp_provider_vault_lib_rs_source_pass2();
@@ -14094,6 +13753,7 @@ mod tests {
             body
         );
     }
+
     #[test]
     fn set_chip_debit_cap_per_wallet_enforces_ceiling_f8() {
         let src = tlp_provider_vault_lib_rs_source_pass2();
@@ -14101,7 +13761,6 @@ mod tests {
             src.contains("pub const MAX_CHIP_DEBIT_CAP_PER_WALLET: u64 = 100_000_000_000"),
             "F8: MAX_CHIP_DEBIT_CAP_PER_WALLET constant must be defined at $100k"
         );
-        
         let needle = "pub fn set_chip_debit_cap_per_wallet(";
         let idx = src.find(needle).expect("set_chip_debit_cap_per_wallet handler must exist");
         let end = drift_handler_end(src, idx);
@@ -14113,13 +13772,10 @@ mod tests {
              and revert `ChipDebitCapTooHigh`. Source excerpt:\n{}",
             body
         );
-        
         assert!(
             src.contains("ChipDebitCapTooHigh,"),
             "F8: ChipDebitCapTooHigh error variant must be defined"
         );
-        
-        
         assert_eq!(
             MAX_CHIP_DEBIT_CAP_PER_WALLET / DEFAULT_MAX_CHIP_DEBIT_PER_24H_PER_WALLET,
             10,
@@ -14127,36 +13783,16 @@ mod tests {
         );
     }
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
 
-    
+
     #[test]
     fn swap_credit_happy_path_returns_measured_delta() {
-        
         let credited = compute_swap_credit(50_000_000, 0, 0).unwrap();
         assert_eq!(credited, 50_000_000);
     }
 
     #[test]
     fn swap_credit_returns_only_the_new_delta_on_topup() {
-        
         let credited = compute_swap_credit(80_000_000, 50_000_000, 0).unwrap();
         assert_eq!(credited, 30_000_000);
     }
@@ -14169,7 +13805,6 @@ mod tests {
 
     #[test]
     fn swap_credit_monotonic_guard_rejects_holder_below_escrow() {
-        
         let err = compute_swap_credit(40_000_000, 50_000_000, 0).unwrap_err();
         assert_eq!(
             err,
@@ -14180,36 +13815,30 @@ mod tests {
 
     #[test]
     fn swap_credit_min_out_floor_rejects_below_floor() {
-        
         let err = compute_swap_credit(9_000_000, 0, 10_000_000).unwrap_err();
         assert_eq!(err, ProviderVaultError::CreditBelowMinOut.into());
     }
 
     #[test]
     fn swap_credit_min_out_floor_passes_at_exact_floor() {
-        
         let credited = compute_swap_credit(10_000_000, 0, 10_000_000).unwrap();
         assert_eq!(credited, 10_000_000);
     }
 
     #[test]
     fn swap_credit_min_out_floor_passes_with_positive_slippage() {
-        
         let credited = compute_swap_credit(12_000_000, 0, 10_000_000).unwrap();
         assert_eq!(credited, 12_000_000, "positive slippage must self-heal");
     }
 
     #[test]
     fn swap_credit_floor_zero_skips_floor_check() {
-        
         assert_eq!(compute_swap_credit(1, 0, 0).unwrap(), 1);
         assert_eq!(compute_swap_credit(0, 0, 0).unwrap(), 0);
     }
 
     #[test]
     fn swap_credit_absolute_reconcile_is_idempotent_on_escrow_struct() {
-        
-        
         let mut escrow = ProviderPlayerEscrow {
             wallet: Pubkey::new_unique(),
             mint: Pubkey::new_unique(),
@@ -14221,17 +13850,16 @@ mod tests {
         };
         let holder = 75_000_000u64;
 
-        
         let d1 = compute_swap_credit(holder, escrow.amount, 0).unwrap();
-        escrow.amount = holder; 
+        escrow.amount = holder;
         assert_eq!(d1, 75_000_000);
         assert_eq!(escrow.amount, 75_000_000);
+
         let d2 = compute_swap_credit(holder, escrow.amount, 0).unwrap();
         escrow.amount = holder;
         assert_eq!(d2, 0, "replay must credit 0");
         assert_eq!(escrow.amount, 75_000_000, "replay must not change amount");
 
-        
         let holder2 = 100_000_000u64;
         let d3 = compute_swap_credit(holder2, escrow.amount, 0).unwrap();
         escrow.amount = holder2;
@@ -14241,8 +13869,6 @@ mod tests {
 
     #[test]
     fn swap_credit_new_error_discriminants_are_distinct() {
-        
-        
         let s = [
             ProviderVaultError::CreditBelowMinOut as u32,
             ProviderVaultError::HolderBalanceDecreased as u32,
@@ -14259,23 +13885,12 @@ mod tests {
         }
     }
 
-    
-    
-    
-    
-    
-    
-    
 
     fn credit_swap_fn_src() -> &'static str {
         let src = tlp_provider_vault_lib_rs_source();
         let start = src
             .find("pub fn credit_chips_from_swap(")
             .expect("credit_chips_from_swap fn must exist");
-        
-        
-        
-        
         let rest = &src[start..];
         let end = start
             + rest
@@ -14296,20 +13911,17 @@ mod tests {
 
     #[test]
     fn credit_swap_src_reloads_holder_before_measuring() {
-        
         let f = credit_swap_fn_src();
         assert!(
             f.contains("ctx.accounts.escrow_holder.reload()?;"),
             "must reload() the holder before measuring its balance"
         );
-        
         assert!(f.contains("ctx.accounts.escrow_holder.amount"));
         assert!(f.contains("compute_swap_credit(holder_balance, escrow.amount, min_out_floor)"));
     }
 
     #[test]
     fn credit_swap_src_absolute_reconcile_never_plus_equals() {
-        
         let f = credit_swap_fn_src();
         assert!(
             f.contains("escrow.amount = holder_balance;"),
@@ -14327,7 +13939,6 @@ mod tests {
 
     #[test]
     fn credit_swap_src_moves_no_tokens() {
-        
         let f = credit_swap_fn_src();
         assert!(!f.contains("token::transfer"), "reconciler must move zero tokens");
         assert!(!f.contains("Transfer {"), "reconciler must not build a Transfer CPI");
@@ -14337,7 +13948,6 @@ mod tests {
 
     #[test]
     fn credit_swap_src_is_permissionless() {
-        
         let f = credit_swap_fn_src();
         assert!(
             !f.contains("ProviderVaultError::Unauthorized"),
@@ -14347,15 +13957,12 @@ mod tests {
             !f.contains("operator_pubkey"),
             "credit must not gate on operator_pubkey"
         );
-        
         assert!(f.contains("ProviderVaultError::VaultFrozen"));
         assert!(f.contains("ProviderVaultError::VaultPaused"));
     }
 
     #[test]
     fn credit_swap_ctx_pins_mint_to_config_not_arg() {
-        
-        
         let c = credit_swap_ctx_src();
         assert!(
             c.contains("token::mint = asset_pool.asset_mint"),
@@ -14389,6 +13996,7 @@ mod tests {
             "player must be a non-signing AccountInfo (seed source only)"
         );
     }
+
     #[test]
     fn credit_swap_ctx_has_three_distinct_pdas() {
         let c = credit_swap_ctx_src();
@@ -14405,8 +14013,6 @@ mod tests {
 
     #[test]
     fn credit_swap_ctx_touches_no_lp_buckets() {
-        
-        
         let c = credit_swap_ctx_src();
         assert!(!c.contains("vault_holder"), "no vault_holder in the credit context");
         assert!(!c.contains("pending_"), "no pending_* earmark bucket in the credit context");
@@ -14414,57 +14020,29 @@ mod tests {
 
     #[test]
     fn credit_swap_ctx_all_accounts_anchor_typed() {
-        
-        
         let c = credit_swap_ctx_src();
         assert!(c.contains("pub vault_config: Box<Account<'info, VaultConfig>>"));
         assert!(c.contains("pub asset_pool: Box<Account<'info, AssetPool>>"));
         assert!(c.contains("pub player_escrow: Box<Account<'info, ProviderPlayerEscrow>>"));
         assert!(c.contains("pub escrow_holder: Box<Account<'info, TokenAccount>>"));
     }
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
 
-    
-    
-    
-    
-    
+
     #[test]
     fn escrow_holder_canonical_ata_pin_gate() {
-        
-        
-        
         let pin_ok = |canonical_ata: Pubkey, supplied: Pubkey| -> bool { supplied == canonical_ata };
 
         let canonical_ata = Pubkey::new_unique();
-        
-        
-        
         let decoy = Pubkey::new_unique();
         assert_ne!(canonical_ata, decoy);
 
-        
         assert!(pin_ok(canonical_ata, canonical_ata), "canonical ATA must pass");
 
-        
         assert!(
             !pin_ok(canonical_ata, decoy),
             "C-01: a decoy authority-owned account MUST be rejected even on first touch"
         );
 
-        
-        
         assert!(
             !pin_ok(canonical_ata, decoy),
             "C-01: a decoy MUST never be accepted on any call"
@@ -14502,12 +14080,10 @@ mod tests {
                 c.contains("@ ProviderVaultError::EscrowHolderMismatch"),
                 "{name} ATA pin must map to EscrowHolderMismatch"
             );
-            
             assert!(
                 c.contains("token::authority = escrow_holder_authority"),
                 "{name} must keep token::authority = escrow_holder_authority"
             );
-            
             assert!(
                 !c.contains(record_pin),
                 "{name} must NOT carry the record-and-pin escrow_holder constraint (C-01 regression)"
@@ -14515,14 +14091,6 @@ mod tests {
         }
     }
 
-    
-    
-    
-    
-    
-    
-    
-    
     #[test]
     fn c01_no_handler_records_holder() {
         let full = tlp_provider_vault_lib_rs_source();
@@ -14530,8 +14098,6 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("program code precedes the #[cfg(test)] module");
-        
-        
         let latch = format!("escrow.{}", "escrow_holder = ctx.accounts.escrow_holder.key();");
         let guard = format!("if escrow.{}", "escrow_holder == Pubkey::default() {");
         assert!(
@@ -14544,12 +14110,6 @@ mod tests {
         );
     }
 
-    
-    
-    
-    
-    
-    
     #[test]
     fn c01_struct_field_removed_and_error_exists() {
         let full = tlp_provider_vault_lib_rs_source();
@@ -14566,7 +14126,6 @@ mod tests {
             full.contains("EscrowHolderMismatch,"),
             "EscrowHolderMismatch error variant must still exist (now used by the ATA pin)"
         );
-        
         assert_eq!(ProviderPlayerEscrow::LEN, 113);
     }
 }
