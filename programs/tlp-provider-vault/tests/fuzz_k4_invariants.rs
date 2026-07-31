@@ -5,7 +5,8 @@ use proptest::prelude::*;
 use tlp_provider_vault::{
     accrue_affiliate_amount, accrue_earmarks, advance_hwm_on_drain, compute_net_ggr,
     compute_swap_credit, compute_weighted_lp_bps, effective_accrual_base, phase_split_bps,
-    require_earmark_invariant, sum_earmarks, AssetPool, MAX_DEV_FEE_BPS, SOVEREIGN_CARVE_BPS,
+    provider_period_fee_step, require_earmark_invariant, sum_earmarks, AssetPool, MAX_DEV_FEE_BPS,
+    MAX_PROVIDER_FEE_BPS, SOVEREIGN_CARVE_BPS,
 };
 
 
@@ -181,6 +182,7 @@ impl Model {
                     fee_due,
                     *dev_fee_bps,
                     cost_netted,
+                    0,
                 )
                 .is_err()
                 {
@@ -519,7 +521,7 @@ proptest! {
         let mut pool = make_pool(tier_tokens, fb_in_window);
         let fee_due: u64 = ((net as u128) * (provider_fee_bps as u128) / 10_000u128) as u64;
 
-        accrue_earmarks(&mut pool, net, phase, provider_fee_bps, fee_due, dev_fee_bps, 0)
+        accrue_earmarks(&mut pool, net, phase, provider_fee_bps, fee_due, dev_fee_bps, 0, 0)
             .expect("positive accrual within bounds must not error");
         let got_provider = pool.pending_provider_fee;
         let got_dev = pool.pending_dev_fee;
@@ -574,7 +576,7 @@ proptest! {
         let before = [seed_dev, seed_sov, seed_yield, seed_reserve];
 
         let net_neg = -(loss as i64);
-        accrue_earmarks(&mut pool, net_neg, phase, 0, 0, dev_fee_bps, 0)
+        accrue_earmarks(&mut pool, net_neg, phase, 0, 0, dev_fee_bps, 0, 0)
             .expect("negative unwind must not error (saturating)");
 
         let after = [
@@ -609,6 +611,100 @@ proptest! {
                 prop_assert_eq!(res.unwrap(), delta, "credit must equal measured holder-escrow delta");
             }
         }
+    }
+
+    #[test]
+    fn period_fee_tracks_period_net_over_random_receipt_sequences(
+        receipts in prop::collection::vec(-(MAX_AMT as i64)..(MAX_AMT as i64), 1..24),
+        bps in 0u16..(MAX_PROVIDER_FEE_BPS + 1),
+    ) {
+        let mut period_net: i64 = 0;
+        let mut charged: u64 = 0;
+        let mut pool_mirror: u64 = 0;
+        let mut provider_mirror: u64 = 0;
+
+        for r in &receipts {
+            let step = provider_period_fee_step(period_net, *r, charged, bps)
+                .expect("no overflow within MAX_AMT×24");
+
+            prop_assert!(
+                step.increase == 0 || step.decrease == 0,
+                "increase {} and decrease {} must be mutually exclusive",
+                step.increase, step.decrease
+            );
+            prop_assert!(
+                step.decrease <= charged,
+                "decrease {} exceeded period_fee_charged {} — would desync mirrors",
+                step.decrease, charged
+            );
+
+            pool_mirror = pool_mirror
+                .checked_add(step.increase).expect("pool mirror add")
+                .checked_sub(step.decrease).expect("pool mirror sub must not underflow");
+            provider_mirror = provider_mirror
+                .checked_add(step.increase).expect("provider mirror add")
+                .checked_sub(step.decrease).expect("provider mirror sub must not underflow");
+            prop_assert_eq!(pool_mirror, provider_mirror, "mirrors must move in lockstep");
+
+            period_net = step.period_net_after;
+            charged = step.fee_target;
+            prop_assert_eq!(charged, pool_mirror, "the mirrors ARE the period charge");
+        }
+
+        let expected: u64 = if period_net > 0 {
+            ((period_net as u128) * bps as u128 / 10_000u128) as u64
+        } else {
+            0
+        };
+        prop_assert_eq!(
+            charged, expected,
+            "period fee must be max(0, period_net={}) × {}bps, not the sum of winning days",
+            period_net, bps
+        );
+        if period_net <= 0 {
+            prop_assert_eq!(charged, 0u64, "a net-negative period must owe zero");
+        }
+        prop_assert!(
+            (charged as u128) <= (period_net.max(0) as u128),
+            "fee {} exceeded the period's net profit {}",
+            charged, period_net
+        );
+    }
+
+    #[test]
+    fn falling_provider_fee_never_grows_sum_earmarks(
+        seed_dev in 0u64..MAX_AMT,
+        seed_sov in 0u64..MAX_AMT,
+        seed_yield in 0u64..MAX_AMT,
+        seed_reserve in 0u64..MAX_AMT,
+        seed_affiliate in 0u64..MAX_AMT,
+        seed_promo in 0u64..MAX_AMT,
+        seed_owed_total in 0u64..MAX_AMT,
+        seed_provider_fee in 0u64..MAX_AMT,
+        decrease in 0u64..MAX_AMT,
+        tier_tokens in arb_tier_tokens(),
+    ) {
+        let mut pool = make_pool(tier_tokens, 0);
+        pool.pending_dev_fee = seed_dev;
+        pool.pending_sovereign = seed_sov;
+        pool.pending_yield = seed_yield;
+        pool.pending_reserve = seed_reserve;
+        pool.pending_affiliate = seed_affiliate;
+        pool.pending_promo = seed_promo;
+        pool.provider_owed_total = seed_owed_total;
+        pool.pending_provider_fee = seed_provider_fee;
+
+        let before = sum_earmarks(&pool);
+        pool.pending_provider_fee = pool.pending_provider_fee.saturating_sub(decrease);
+        let after = sum_earmarks(&pool);
+
+        prop_assert!(after <= before, "a fee DECREASE grew sum_earmarks: {} -> {}", before, after);
+        prop_assert!(
+            require_earmark_invariant(&pool, before).is_ok(),
+            "the tightest pre-reduction-solvent holder ({}) must remain solvent \
+             after the fee reduction (post-sum {})",
+            before, after
+        );
     }
 }
 
@@ -690,7 +786,7 @@ fn affiliate_netting_matches_reduced_base_and_conserves() {
 
     let whale: [u64; 5] = [0, 0, 0, 0, 1_000_000];
     let mut base = make_pool(whale, 0);
-    accrue_earmarks(&mut base, g as i64, phase, 0, fee, dev_bps, 0).unwrap();
+    accrue_earmarks(&mut base, g as i64, phase, 0, fee, dev_bps, 0, 0).unwrap();
     let base_protocol = protocol_drain(&base);
     let base_lp = g - base_protocol;
 
@@ -699,7 +795,7 @@ fn affiliate_netting_matches_reduced_base_and_conserves() {
     assert_eq!(p.pending_affiliate, a);
     assert_eq!(p.affiliate_unreconciled, a);
     let cost_netted = a.min(g - fee);
-    accrue_earmarks(&mut p, g as i64, phase, 0, fee, dev_bps, cost_netted).unwrap();
+    accrue_earmarks(&mut p, g as i64, phase, 0, fee, dev_bps, cost_netted, 0).unwrap();
     p.affiliate_unreconciled -= cost_netted;
 
     let r = reference_waterfall(&p, g - a, fee, phase, dev_bps);

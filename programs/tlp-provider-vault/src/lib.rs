@@ -425,7 +425,11 @@ pub mod tlp_provider_vault {
         provider.last_submission_at = 0;
         provider.last_day_id = 0;
 
-        provider.reserved = [0u8; 64];
+        provider.period_net_ggr = 0;
+        provider.period_fee_charged = 0;
+        provider.fee_correction_applied = 0;
+
+        provider.reserved = [0u8; 47];
 
         config.next_provider_id = config
             .next_provider_id
@@ -462,6 +466,10 @@ pub mod tlp_provider_vault {
         );
         let provider = &mut ctx.accounts.provider;
         require!(provider.provider_id == provider_id, ProviderVaultError::ProviderMismatch);
+        require!(
+            provider.period_net_ggr <= 0,
+            ProviderVaultError::FeeBpsChangeWouldRepriceOpenPeriod
+        );
         let old = provider.provider_fee_bps;
         provider.provider_fee_bps = new_bps;
         emit!(ProviderFeeUpdated {
@@ -648,19 +656,23 @@ pub mod tlp_provider_vault {
 
         let snapshot_bps = provider.provider_fee_bps;
 
-        let fee_due: u64 = if net_ggr_signed > 0 {
-            ((net_ggr_signed as u128)
-                .checked_mul(snapshot_bps as u128)
-                .ok_or(ProviderVaultError::MathOverflow)?
-                / 10_000u128) as u64
-        } else {
-            0
-        };
+        let fee_step = provider_period_fee_step(
+            provider.period_net_ggr,
+            net_ggr_signed,
+            provider.period_fee_charged,
+            snapshot_bps,
+        )?;
+        provider.period_net_ggr = fee_step.period_net_after;
+        provider.period_fee_charged = fee_step.fee_target;
+
+        let fee_due: u64 = fee_step.increase;
 
         provider.fee_owed_since_last_sweep = provider
             .fee_owed_since_last_sweep
             .checked_add(fee_due)
             .ok_or(ProviderVaultError::MathOverflow)?;
+
+        reduce_provider_fee_accrual(pool, provider, fee_step.decrease);
 
         provider.cumulative_gross_wager = provider
             .cumulative_gross_wager
@@ -717,6 +729,7 @@ pub mod tlp_provider_vault {
             fee_due,
             config.dev_fee_bps,
             cost_netted,
+            fee_step.decrease,
         )?;
 
         pool.promo_paid_unreconciled = pool
@@ -760,6 +773,9 @@ pub mod tlp_provider_vault {
             affiliate_netted: affiliate_to_net,
             new_affiliate_unreconciled: pool.affiliate_unreconciled,
             timestamp: receipt.submitted_at,
+            fee_decrease: fee_step.decrease,
+            period_net_ggr: fee_step.period_net_after,
+            period_fee_charged: fee_step.fee_target,
         });
         Ok(())
     }
@@ -1033,6 +1049,9 @@ pub mod tlp_provider_vault {
         let amount = provider.fee_owed_since_last_sweep;
         require!(amount > 0, ProviderVaultError::NothingOwed);
 
+        provider.period_net_ggr = 0;
+        provider.period_fee_charged = 0;
+
         provider.fee_owed_since_last_sweep = 0;
         pool.pending_provider_fee = pool
             .pending_provider_fee
@@ -1053,6 +1072,86 @@ pub mod tlp_provider_vault {
             amount,
             owed_after: owed.amount,
             timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    pub fn correct_provider_fee_overaccrual(
+        ctx: Context<CorrectProviderFeeOverAccrual>,
+        provider_id: u32,
+        asset_mint: Pubkey,
+        expected_pending_provider_fee: u64,
+        expected_fee_owed_since_last_sweep: u64,
+        new_pending_provider_fee: u64,
+    ) -> Result<()> {
+        let config = &ctx.accounts.vault_config;
+        require_keys_eq!(
+            ctx.accounts.authority.key(),
+            config.authority,
+            ProviderVaultError::Unauthorized
+        );
+
+        let pool = &mut ctx.accounts.asset_pool;
+        let provider = &mut ctx.accounts.provider;
+        require!(provider.provider_id == provider_id, ProviderVaultError::ProviderMismatch);
+        require!(pool.asset_mint == asset_mint, ProviderVaultError::AssetMismatch);
+
+        require!(
+            provider.fee_correction_applied == 0,
+            ProviderVaultError::FeeCorrectionAlreadyApplied
+        );
+
+        require!(
+            pool.pending_provider_fee == expected_pending_provider_fee
+                && provider.fee_owed_since_last_sweep == expected_fee_owed_since_last_sweep,
+            ProviderVaultError::FeeCorrectionPreStateMismatch
+        );
+
+        require!(
+            new_pending_provider_fee < expected_pending_provider_fee,
+            ProviderVaultError::FeeCorrectionMustDecrease
+        );
+        let delta = expected_pending_provider_fee
+            .checked_sub(new_pending_provider_fee)
+            .ok_or(ProviderVaultError::MathOverflow)?;
+        require!(
+            delta <= expected_fee_owed_since_last_sweep,
+            ProviderVaultError::FeeCorrectionMustDecrease
+        );
+
+        let holder_balance = ctx.accounts.vault_holder.amount;
+        let nav_before = nav_basis(pool, holder_balance)?;
+        let fee_owed_before = provider.fee_owed_since_last_sweep;
+
+        pool.pending_provider_fee = pool
+            .pending_provider_fee
+            .checked_sub(delta)
+            .ok_or(ProviderVaultError::MathOverflow)?;
+        provider.fee_owed_since_last_sweep = provider
+            .fee_owed_since_last_sweep
+            .checked_sub(delta)
+            .ok_or(ProviderVaultError::MathOverflow)?;
+        provider.fee_correction_applied = 1;
+
+        require_earmark_invariant(pool, holder_balance)?;
+        let nav_after = nav_basis(pool, holder_balance)?;
+
+        let now = Clock::get()?.unix_timestamp;
+        recompute_circuit_state(pool, holder_balance, now)?;
+
+        emit!(ProviderFeeOverAccrualCorrected {
+            provider_id,
+            asset_mint,
+            authority: ctx.accounts.authority.key(),
+            pending_provider_fee_before: expected_pending_provider_fee,
+            pending_provider_fee_after: pool.pending_provider_fee,
+            fee_owed_before,
+            fee_owed_after: provider.fee_owed_since_last_sweep,
+            delta,
+            holder_balance,
+            nav_before,
+            nav_after,
+            timestamp: now,
         });
         Ok(())
     }
@@ -4336,6 +4435,60 @@ pub fn advance_hwm_on_drain(pool: &mut AssetPool) {
     pool.last_distributed_gross_ggr = floored.max(pool.cumulative_gross_ggr);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderFeeStep {
+    pub period_net_after: i64,
+    pub fee_target: u64,
+    pub increase: u64,
+    pub decrease: u64,
+}
+
+pub fn provider_period_fee_step(
+    period_net_before: i64,
+    net_ggr_signed: i64,
+    period_fee_charged: u64,
+    bps: u16,
+) -> Result<ProviderFeeStep> {
+    let period_net_after = period_net_before
+        .checked_add(net_ggr_signed)
+        .ok_or(ProviderVaultError::MathOverflow)?;
+
+    let fee_target: u64 = if period_net_after > 0 {
+        ((period_net_after as u128)
+            .checked_mul(bps as u128)
+            .ok_or(ProviderVaultError::MathOverflow)?
+            / 10_000u128) as u64
+    } else {
+        0
+    };
+
+    let (increase, decrease) = if fee_target >= period_fee_charged {
+        (fee_target - period_fee_charged, 0u64)
+    } else {
+        (0u64, period_fee_charged - fee_target)
+    };
+
+    Ok(ProviderFeeStep {
+        period_net_after,
+        fee_target,
+        increase,
+        decrease,
+    })
+}
+
+pub fn reduce_provider_fee_accrual(
+    pool: &mut AssetPool,
+    provider: &mut Provider,
+    decrease: u64,
+) {
+    if decrease == 0 {
+        return;
+    }
+    pool.pending_provider_fee = pool.pending_provider_fee.saturating_sub(decrease);
+    provider.fee_owed_since_last_sweep =
+        provider.fee_owed_since_last_sweep.saturating_sub(decrease);
+}
+
 pub fn accrue_earmarks(
     pool: &mut AssetPool,
     net_delta_signed: i64,
@@ -4344,6 +4497,7 @@ pub fn accrue_earmarks(
     fee_due: u64,
     dev_fee_bps: u16,
     cost_netted: u64,
+    fee_release: u64,
 ) -> Result<()> {
     require!(dev_fee_bps <= MAX_DEV_FEE_BPS, ProviderVaultError::InvalidBps);
 
@@ -4351,6 +4505,8 @@ pub fn accrue_earmarks(
         compute_weighted_lp_bps(pool, phase, pool.founding_banker_lp_tokens_in_window)?;
 
     if net_delta_signed >= 0 {
+        require!(fee_release == 0, ProviderVaultError::FeeReleaseOnPositiveReceipt);
+
         let net_delta = net_delta_signed as u64;
 
         pool.pending_provider_fee = pool
@@ -4434,7 +4590,7 @@ pub fn accrue_earmarks(
     } else {
         require!(cost_netted == 0, ProviderVaultError::PromoNetExceedsBase);
         let abs_delta = net_delta_signed.unsigned_abs();
-        let after_provider = abs_delta;
+        let after_provider = abs_delta.saturating_sub(fee_release);
 
         let dev_fee_unwind = ((after_provider as u128)
             .saturating_mul(dev_fee_bps as u128)
@@ -4931,6 +5087,16 @@ pub enum ProviderVaultError {
     DrainedPoolReseedDisallowed,
     #[msg("Receipt net GGR exceeds the per-receipt cap — max(20% of vault holder, $1,000)")]
     GgrExceedsCap,
+    #[msg("Provider fee correction has already been applied for this provider — one-shot only")]
+    FeeCorrectionAlreadyApplied,
+    #[msg("Observed state does not match the attested expected pre-state — refusing to correct")]
+    FeeCorrectionPreStateMismatch,
+    #[msg("Provider fee correction must strictly DECREASE the accrual; it can never raise a bucket")]
+    FeeCorrectionMustDecrease,
+    #[msg("Cannot change provider_fee_bps while the period is in profit — it would retroactively reprice accrued GGR and misroute released fee into LP NAV. Flush the period first.")]
+    FeeBpsChangeWouldRepriceOpenPeriod,
+    #[msg("A positive receipt released period fee, which the positive cascade cannot absorb — the mid-period rate-change guard should have made this unreachable")]
+    FeeReleaseOnPositiveReceipt,
 }
 
 
@@ -5132,7 +5298,11 @@ pub struct Provider {
     pub last_submission_at: i64,
     pub last_day_id: u64,
 
-    pub reserved: [u8; 64],
+    pub period_net_ggr: i64,
+    pub period_fee_charged: u64,
+    pub fee_correction_applied: u8,
+
+    pub reserved: [u8; 47],
 }
 impl Provider {
     pub const LEN: usize = 8
@@ -5146,7 +5316,10 @@ impl Provider {
         + 32
         + 32
         + 8 * 6
-        + 64;
+        + 8
+        + 8
+        + 1
+        + 47;
 }
 
 #[account]
@@ -5499,6 +5672,32 @@ pub struct FlushProviderFee<'info> {
     #[account(mut)]
     pub signer: Signer<'info>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(provider_id: u32, asset_mint: Pubkey)]
+pub struct CorrectProviderFeeOverAccrual<'info> {
+    #[account(seeds = [b"provider_vault_config"], bump = vault_config.bump)]
+    pub vault_config: Box<Account<'info, VaultConfig>>,
+    #[account(
+        mut,
+        seeds = [b"asset_pool", vault_config.key().as_ref(), asset_mint.as_ref()],
+        bump = asset_pool.bump
+    )]
+    pub asset_pool: Box<Account<'info, AssetPool>>,
+    #[account(
+        mut,
+        seeds = [b"provider", provider_id.to_le_bytes().as_ref()],
+        bump = provider.bump
+    )]
+    pub provider: Box<Account<'info, Provider>>,
+    #[account(
+        token::mint = asset_mint,
+        token::authority = asset_pool,
+        address = asset_pool.vault_holder,
+    )]
+    pub vault_holder: Box<Account<'info, TokenAccount>>,
+    pub authority: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -6736,6 +6935,25 @@ pub struct ProviderGgrSubmitted {
     pub affiliate_netted: u64,
     pub new_affiliate_unreconciled: u64,
     pub timestamp: i64,
+    pub fee_decrease: u64,
+    pub period_net_ggr: i64,
+    pub period_fee_charged: u64,
+}
+
+#[event]
+pub struct ProviderFeeOverAccrualCorrected {
+    pub provider_id: u32,
+    pub asset_mint: Pubkey,
+    pub authority: Pubkey,
+    pub pending_provider_fee_before: u64,
+    pub pending_provider_fee_after: u64,
+    pub fee_owed_before: u64,
+    pub fee_owed_after: u64,
+    pub delta: u64,
+    pub holder_balance: u64,
+    pub nav_before: u64,
+    pub nav_after: u64,
+    pub timestamp: i64,
 }
 
 #[event]
@@ -7547,7 +7765,7 @@ mod tests {
         p.lp_tokens_by_tier = [0, 0, 100, 0, 0];
         let net = 1_000_000_000i64;
         let fee_due = (net as u64) * DEFAULT_PROVIDER_FEE_BPS as u64 / 10_000;
-        accrue_earmarks(&mut p, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee_due, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee_due, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert_eq!(p.pending_provider_fee, fee_due);
         assert_eq!(p.pending_dev_fee, 22_500_000);
         assert_eq!(p.pending_sovereign, 10_968_750);
@@ -7561,7 +7779,7 @@ mod tests {
         p.lp_tokens_by_tier = [100, 0, 0, 0, 0];
         let net = 1_000_000_000i64;
         let fee_due = (net as u64) * DEFAULT_PROVIDER_FEE_BPS as u64 / 10_000;
-        accrue_earmarks(&mut p, net, 0, DEFAULT_PROVIDER_FEE_BPS, fee_due, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net, 0, DEFAULT_PROVIDER_FEE_BPS, fee_due, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert!(p.pending_dev_fee > 0);
     }
 
@@ -7572,7 +7790,7 @@ mod tests {
         p.pending_sovereign = 5_000;
         p.pending_yield = 50_000;
         p.pending_reserve = 10_000;
-        accrue_earmarks(&mut p, -100_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, -100_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert_eq!(p.pending_dev_fee, 0);
         assert_eq!(p.pending_sovereign, 0);
         assert_eq!(p.pending_yield, 0);
@@ -7583,14 +7801,14 @@ mod tests {
     fn earmarks_negative_under_unwind_saturates() {
         let mut p = fresh_pool(Pubkey::new_unique());
         p.pending_dev_fee = 1;
-        accrue_earmarks(&mut p, -10_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, -10_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert_eq!(p.pending_dev_fee, 0);
     }
 
     #[test]
     fn earmarks_zero_delta_no_op() {
         let mut p = fresh_pool(Pubkey::new_unique());
-        accrue_earmarks(&mut p, 0, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, 0, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert_eq!(p.pending_dev_fee, 0);
         assert_eq!(p.pending_provider_fee, 0);
         assert_eq!(p.pending_sovereign, 0);
@@ -7604,11 +7822,11 @@ mod tests {
         p.lp_tokens_by_tier = [0, 0, 100, 0, 0];
         let net1 = 1_000_000_000i64;
         let fee1 = (net1 as u64) * DEFAULT_PROVIDER_FEE_BPS as u64 / 10_000;
-        accrue_earmarks(&mut p, net1, 1, DEFAULT_PROVIDER_FEE_BPS, fee1, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net1, 1, DEFAULT_PROVIDER_FEE_BPS, fee1, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         let dev_after_first = p.pending_dev_fee;
-        accrue_earmarks(&mut p, -200_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, -200_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert!(p.pending_dev_fee < dev_after_first);
-        accrue_earmarks(&mut p, 500_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 12_500_000, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, 500_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 12_500_000, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert!(p.pending_dev_fee > 0);
         assert!(p.pending_provider_fee > 0);
     }
@@ -7772,7 +7990,7 @@ mod tests {
     fn pool_state_isolation_independent_counters() {
         let mut usdc = fresh_pool(Pubkey::new_unique());
         let mut sol = fresh_pool(Pubkey::new_unique());
-        accrue_earmarks(&mut usdc, 1_000_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 100_000_000, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut usdc, 1_000_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 100_000_000, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert!(usdc.pending_dev_fee > 0);
         assert_eq!(sol.pending_dev_fee, 0);
         assert_eq!(sol.pending_provider_fee, 0);
@@ -8016,7 +8234,7 @@ mod tests {
         let affiliate = 1_000_000_000u64;
 
         let mut base = fresh_pool(mint);
-        accrue_earmarks(&mut base, net, 1, 0, fee, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut base, net, 1, 0, fee, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         let base_protocol_earmarks = base.pending_dev_fee
             + base.pending_sovereign
             + base.pending_yield
@@ -8032,7 +8250,7 @@ mod tests {
         let remaining = after_provider - promo_to_net;
         let affiliate_to_net = p.affiliate_unreconciled.min(remaining);
         let cost_netted = promo_to_net + affiliate_to_net;
-        accrue_earmarks(&mut p, net, 1, 0, fee, DEFAULT_DEV_FEE_BPS, cost_netted).unwrap();
+        accrue_earmarks(&mut p, net, 1, 0, fee, DEFAULT_DEV_FEE_BPS, cost_netted, 0).unwrap();
         p.affiliate_unreconciled -= affiliate_to_net;
 
         assert_eq!(affiliate_to_net, affiliate);
@@ -8367,7 +8585,10 @@ mod tests {
             cumulative_bet_count: 0,
             last_submission_at: 0,
             last_day_id: 0,
-            reserved: [0u8; 64],
+            period_net_ggr: 0,
+            period_fee_charged: 0,
+            fee_correction_applied: 0,
+            reserved: [0u8; 47],
         };
         assert!(!p.settle_paused);
         p.settle_paused = true;
@@ -8406,7 +8627,7 @@ mod tests {
         p.lp_tokens_by_tier = [100, 0, 0, 0, 0];
         let net = 1_000_000_000i64;
         let fee_due = (net as u64) * DEFAULT_PROVIDER_FEE_BPS as u64 / 10_000;
-        accrue_earmarks(&mut p, net, 0, DEFAULT_PROVIDER_FEE_BPS, fee_due, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net, 0, DEFAULT_PROVIDER_FEE_BPS, fee_due, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert!(p.pending_yield > 0);
     }
 
@@ -8434,12 +8655,12 @@ mod tests {
         p.lp_tokens_by_tier = [0, 0, 100, 0, 0];
         let net_day1 = 2_000_000_000i64;
         let fee_due_day1 = (net_day1 as u64) * DEFAULT_PROVIDER_FEE_BPS as u64 / 10_000;
-        accrue_earmarks(&mut p, net_day1, 1, DEFAULT_PROVIDER_FEE_BPS, fee_due_day1, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net_day1, 1, DEFAULT_PROVIDER_FEE_BPS, fee_due_day1, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         accrue_affiliate_amount(&mut p, 50_000_000).unwrap();
         p.cumulative_gross_ggr += net_day1;
         let net_day2 = 1_000_000_000i64;
         let fee_due_day2 = (net_day2 as u64) * DEFAULT_PROVIDER_FEE_BPS as u64 / 10_000;
-        accrue_earmarks(&mut p, net_day2, 1, DEFAULT_PROVIDER_FEE_BPS, fee_due_day2, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net_day2, 1, DEFAULT_PROVIDER_FEE_BPS, fee_due_day2, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         accrue_affiliate_amount(&mut p, 30_000_000).unwrap();
         p.cumulative_gross_ggr += net_day2;
         let delta_gross = p.cumulative_gross_ggr - p.last_distributed_gross_ggr;
@@ -8456,7 +8677,7 @@ mod tests {
         let mut p = fresh_pool(Pubkey::new_unique());
         p.lp_tokens_by_tier = [0, 0, 100, 0, 0];
         let net = 100_000_000i64;
-        accrue_earmarks(&mut p, net, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         accrue_affiliate_amount(&mut p, 200_000_000).unwrap();
         p.cumulative_gross_ggr += net;
         let delta_gross = p.cumulative_gross_ggr - p.last_distributed_gross_ggr;
@@ -8468,7 +8689,7 @@ mod tests {
     fn pattern_y_at_threshold_edge() {
         let mut p = fresh_pool(Pubkey::new_unique());
         let net = MIN_DELTA_GGR_FOR_SWEEP_USDC as i64 + 1_000_000;
-        accrue_earmarks(&mut p, net, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         accrue_affiliate_amount(&mut p, 1_000_001).unwrap();
         p.cumulative_gross_ggr += net;
         let delta_gross = p.cumulative_gross_ggr - p.last_distributed_gross_ggr;
@@ -8549,7 +8770,7 @@ mod tests {
         p.lp_tokens_by_tier = [0, 0, 100, 0, 0];
         let net = 1_000_000_000i64;
         let provider_fee = (net as u64) * 1_000 / 10_000;
-        accrue_earmarks(&mut p, net, 1, 1_000, provider_fee, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net, 1, 1_000, provider_fee, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert_eq!(p.pending_provider_fee, 100_000_000);
         assert_eq!(p.pending_dev_fee, 22_500_000);
     }
@@ -8559,7 +8780,7 @@ mod tests {
         let mut p = fresh_pool(Pubkey::new_unique());
         p.lp_tokens_by_tier = [0, 0, 100, 0, 0];
         let net = 1_000_000_000i64;
-        accrue_earmarks(&mut p, net, 1, 0, 0, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net, 1, 0, 0, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert_eq!(p.pending_provider_fee, 0);
         assert_eq!(p.pending_dev_fee, 25_000_000);
     }
@@ -8720,6 +8941,854 @@ mod tests {
     }
 
 
+    fn replay_period(bps: u16, receipts: &[i64]) -> (i64, u64, u64, u64) {
+        let mut net = 0i64;
+        let mut charged = 0u64;
+        let (mut up, mut down) = (0u64, 0u64);
+        for &r in receipts {
+            let step = provider_period_fee_step(net, r, charged, bps).unwrap();
+            assert!(
+                step.increase == 0 || step.decrease == 0,
+                "increase/decrease must be mutually exclusive (got +{} / -{})",
+                step.increase,
+                step.decrease
+            );
+            assert!(
+                step.decrease <= charged,
+                "a decrease may never exceed what the period has charged \
+                 (decrease {} > charged {}) — would desync the pool mirror",
+                step.decrease,
+                charged
+            );
+            net = step.period_net_after;
+            charged = step.fee_target;
+            up = up.checked_add(step.increase).unwrap();
+            down = down.checked_add(step.decrease).unwrap();
+        }
+        assert_eq!(
+            charged,
+            up - down,
+            "Σincrease − Σdecrease must equal period_fee_charged"
+        );
+        (net, charged, up, down)
+    }
+
+    #[test]
+    fn period_fee_charges_period_net_not_sum_of_winning_days() {
+        let (net, charged, _, _) =
+            replay_period(1_000, &[1_000_000_000, -600_000_000, 1_000_000_000]);
+        assert_eq!(net, 1_400_000_000);
+        assert_eq!(
+            charged, 140_000_000,
+            "10% of the $1,400 period NET. The shipped rule bills $200 \
+             (10% of the $2,000 of winning days) — the defect."
+        );
+    }
+
+    #[test]
+    fn period_fee_adjusts_down_when_period_dips_before_flush() {
+        let bps = 1_000u16;
+        let s1 = provider_period_fee_step(0, 1_000_000_000, 0, bps).unwrap();
+        assert_eq!(s1.increase, 100_000_000);
+        assert_eq!(s1.fee_target, 100_000_000);
+
+        let s2 = provider_period_fee_step(
+            s1.period_net_after,
+            -400_000_000,
+            s1.fee_target,
+            bps,
+        )
+        .unwrap();
+        assert_eq!(s2.period_net_after, 600_000_000);
+        assert_eq!(s2.fee_target, 60_000_000);
+        assert_eq!(s2.increase, 0);
+        assert_eq!(
+            s2.decrease, 40_000_000,
+            "the fee must fall with the period — impossible under the shipped rule"
+        );
+    }
+
+    #[test]
+    fn period_fee_floors_at_zero_for_a_net_negative_period() {
+        let fresh = provider_period_fee_step(0, -1_000_000_000, 0, 1_000).unwrap();
+        assert_eq!(fresh.period_net_after, -1_000_000_000);
+        assert_eq!(fresh.fee_target, 0);
+        assert_eq!(fresh.increase, 0);
+        assert_eq!(fresh.decrease, 0, "cannot give back what was never charged");
+
+        let (net, charged, up, down) = replay_period(1_000, &[500_000_000, -2_000_000_000]);
+        assert_eq!(net, -1_500_000_000);
+        assert_eq!(charged, 0, "a losing period owes nothing — never negative");
+        assert_eq!(up, 50_000_000);
+        assert_eq!(down, 50_000_000, "exactly the $50 charged comes back, no more");
+    }
+
+    #[test]
+    fn period_fee_live_shape_bills_32_81_not_217_97() {
+        let receipts = [1_000_000_000i64, -1_851_644_605i64, 1_179_720_000i64];
+        assert_eq!(
+            receipts[0] + receipts[2],
+            2_179_720_000,
+            "sum of the winning days, per the on-chain read"
+        );
+        let period_net: i64 = receipts.iter().sum();
+        assert_eq!(period_net, 328_075_395, "lifetime net GGR = $328.075395");
+
+        let (net, charged, _, _) = replay_period(1_000, &receipts);
+        assert_eq!(net, period_net);
+        assert_eq!(
+            charged, 32_807_539,
+            "$32.81 = 10% of the $328.08 monthly NET. The shipped rule accrues \
+             $217.972 (10% of the $2,179.72 of winning days) — a $185.164461 \
+             over-accrual of LP principal."
+        );
+        assert_eq!(217_972_000u64 - charged, 185_164_461);
+    }
+
+    #[test]
+    fn period_fee_decrease_never_exceeds_what_the_period_charged() {
+        for bps in [0u16, 1, 250, 1_000, 2_500] {
+            let (_, charged, up, down) = replay_period(
+                bps,
+                &[
+                    900_000_000,
+                    -1_400_000_000,
+                    300_000_000,
+                    2_000_000_000,
+                    -2_500_000_000,
+                    100_000_000,
+                    -50_000_000,
+                ],
+            );
+            assert!(down <= up, "bps={bps}: can never refund more than charged");
+            assert_eq!(charged, up - down, "bps={bps}");
+        }
+    }
+
+    #[test]
+    fn period_fee_is_path_independent_within_a_period() {
+        let orders: [[i64; 4]; 3] = [
+            [1_000_000_000, -600_000_000, 800_000_000, -200_000_000],
+            [-600_000_000, 1_000_000_000, -200_000_000, 800_000_000],
+            [800_000_000, -200_000_000, -600_000_000, 1_000_000_000],
+        ];
+        let expected = 100_000_000u64;
+        for (i, seq) in orders.iter().enumerate() {
+            let (net, charged, _, _) = replay_period(1_000, seq);
+            assert_eq!(net, 1_000_000_000, "order {i}");
+            assert_eq!(
+                charged, expected,
+                "order {i}: the same receipts must bill the same fee regardless \
+                 of the order they arrive in"
+            );
+        }
+    }
+
+    #[test]
+    fn period_fee_edges_zero_bps_and_overflow() {
+        let z = provider_period_fee_step(0, 5_000_000_000, 0, 0).unwrap();
+        assert_eq!(z.fee_target, 0);
+        assert_eq!(z.increase, 0);
+        assert_eq!(z.decrease, 0);
+
+        assert!(provider_period_fee_step(i64::MAX, 1, 0, 1_000).is_err());
+        assert!(provider_period_fee_step(i64::MIN, -1, 0, 1_000).is_err());
+    }
+
+    fn fresh_provider(bps: u16) -> Provider {
+        Provider {
+            provider_id: 0,
+            name: [0u8; PROVIDER_NAME_LEN],
+            bump: 255,
+            active: true,
+            paused: false,
+            paused_at: 0,
+            settle_paused: false,
+            pause_reason: [0u8; PAUSE_REASON_LEN],
+            provider_fee_bps: bps,
+            fee_owed_since_last_sweep: 0,
+            affiliate_recorder_pubkey: Pubkey::new_unique(),
+            signed_terms_hash: [0u8; 32],
+            cumulative_gross_ggr: 0,
+            cumulative_gross_wager: 0,
+            cumulative_gross_payout: 0,
+            cumulative_bet_count: 0,
+            last_submission_at: 0,
+            last_day_id: 0,
+            period_net_ggr: 0,
+            period_fee_charged: 0,
+            fee_correction_applied: 0,
+            reserved: [0u8; 47],
+        }
+    }
+
+    fn submit_step(pool: &mut AssetPool, provider: &mut Provider, net: i64) {
+        let bps = provider.provider_fee_bps;
+        let step =
+            provider_period_fee_step(provider.period_net_ggr, net, provider.period_fee_charged, bps)
+                .unwrap();
+        provider.period_net_ggr = step.period_net_after;
+        provider.period_fee_charged = step.fee_target;
+        let fee_due = step.increase;
+        provider.fee_owed_since_last_sweep =
+            provider.fee_owed_since_last_sweep.checked_add(fee_due).unwrap();
+        reduce_provider_fee_accrual(pool, provider, step.decrease);
+
+        let cum_before = pool.cumulative_gross_ggr;
+        pool.cumulative_gross_ggr = pool.cumulative_gross_ggr.checked_add(net).unwrap();
+        let base =
+            effective_accrual_base(pool.last_distributed_gross_ggr, cum_before, net).unwrap();
+        accrue_earmarks(pool, base, 0, bps, fee_due, DEFAULT_DEV_FEE_BPS, 0, step.decrease)
+            .unwrap();
+    }
+
+    #[test]
+    fn provider_fee_mirrors_move_in_lockstep() {
+        let mut pool = fresh_pool(Pubkey::new_unique());
+        let mut provider = fresh_provider(1_000);
+        for net in [
+            900_000_000i64,
+            -1_400_000_000,
+            300_000_000,
+            2_000_000_000,
+            -2_500_000_000,
+            1_100_000_000,
+            -50_000_000,
+        ] {
+            submit_step(&mut pool, &mut provider, net);
+            assert_eq!(
+                pool.pending_provider_fee, provider.fee_owed_since_last_sweep,
+                "the two fee mirrors MUST stay equal after every receipt \
+                 (net={net}) — otherwise flush_provider_fee underflows"
+            );
+            assert_eq!(
+                provider.fee_owed_since_last_sweep, provider.period_fee_charged,
+                "within a period the owed slice IS the period charge"
+            );
+        }
+    }
+
+    #[test]
+    fn k4_never_worsens_when_the_period_fee_falls() {
+        let mut pool = fresh_pool(Pubkey::new_unique());
+        let mut provider = fresh_provider(1_000);
+        let holder: u64 = 10_000_000_000;
+        for net in [2_000_000_000i64, -900_000_000, 500_000_000, -3_000_000_000, 800_000_000] {
+            let before = sum_earmarks(&pool);
+            let fee_before = pool.pending_provider_fee;
+            submit_step(&mut pool, &mut provider, net);
+            let after = sum_earmarks(&pool);
+            if pool.pending_provider_fee < fee_before {
+                assert!(
+                    after <= before,
+                    "a falling provider fee must never grow sum_earmarks \
+                     (before={before} after={after})"
+                );
+            }
+            assert!(
+                require_earmark_invariant(&pool, holder).is_ok(),
+                "K4 must hold on every step (net={net})"
+            );
+        }
+    }
+
+    #[test]
+    fn waterfall_buckets_unchanged_for_a_monotonically_rising_period() {
+        let receipts = [400_000_000i64, 1_100_000_000, 250_000_000, 3_000_000_000];
+        let bps = 1_000u16;
+
+        let mut pool_new = fresh_pool(Pubkey::new_unique());
+        let mut prov = fresh_provider(bps);
+        for &n in &receipts {
+            submit_step(&mut pool_new, &mut prov, n);
+        }
+
+        let mut pool_old = fresh_pool(Pubkey::new_unique());
+        for &n in &receipts {
+            let fee_due = ((n as u128) * bps as u128 / 10_000u128) as u64;
+            let cum_before = pool_old.cumulative_gross_ggr;
+            pool_old.cumulative_gross_ggr += n;
+            let base =
+                effective_accrual_base(pool_old.last_distributed_gross_ggr, cum_before, n).unwrap();
+            accrue_earmarks(&mut pool_old, base, 0, bps, fee_due, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
+        }
+
+        assert_eq!(pool_new.pending_dev_fee, pool_old.pending_dev_fee, "dev bucket moved");
+        assert_eq!(pool_new.pending_sovereign, pool_old.pending_sovereign, "sovereign moved");
+        assert_eq!(pool_new.pending_yield, pool_old.pending_yield, "yield moved");
+        assert_eq!(pool_new.pending_reserve, pool_old.pending_reserve, "reserve moved");
+        assert_eq!(
+            pool_new.pending_provider_fee, pool_old.pending_provider_fee,
+            "a purely-winning period must bill EXACTLY what the old rule billed"
+        );
+        assert_eq!(pool_new.cumulative_gross_ggr, pool_old.cumulative_gross_ggr);
+    }
+
+    #[test]
+    fn flush_closes_the_period_and_the_next_one_starts_clean() {
+        let mut pool = fresh_pool(Pubkey::new_unique());
+        let mut provider = fresh_provider(1_000);
+        submit_step(&mut pool, &mut provider, 1_000_000_000);
+        assert_eq!(provider.fee_owed_since_last_sweep, 100_000_000);
+
+        let amount = provider.fee_owed_since_last_sweep;
+        provider.period_net_ggr = 0;
+        provider.period_fee_charged = 0;
+        provider.fee_owed_since_last_sweep = 0;
+        pool.pending_provider_fee = pool.pending_provider_fee.checked_sub(amount).unwrap();
+        pool.provider_owed_total = pool.provider_owed_total.checked_add(amount).unwrap();
+
+        assert_eq!(provider.period_net_ggr, 0, "period must reset");
+        assert_eq!(provider.period_fee_charged, 0, "period charge must reset");
+        assert_eq!(pool.provider_owed_total, 100_000_000);
+
+        submit_step(&mut pool, &mut provider, -5_000_000_000);
+        assert_eq!(
+            pool.provider_owed_total, 100_000_000,
+            "an invoiced amount is untouchable by a later period's losses"
+        );
+        assert_eq!(pool.pending_provider_fee, 0);
+        assert_eq!(provider.fee_owed_since_last_sweep, 0);
+        assert_eq!(provider.period_net_ggr, -5_000_000_000);
+        assert_eq!(provider.period_fee_charged, 0);
+
+        submit_step(&mut pool, &mut provider, 6_000_000_000);
+        assert_eq!(provider.period_net_ggr, 1_000_000_000);
+        assert_eq!(
+            provider.period_fee_charged, 100_000_000,
+            "the carried −$5,000 nets against the +$6,000 first: the provider is \
+             billed on the +$1,000 remainder, NOT on the full $6,000"
+        );
+    }
+
+    fn try_flush(pool: &mut AssetPool, provider: &mut Provider) -> core::result::Result<u64, ()> {
+        let amount = provider.fee_owed_since_last_sweep;
+        if amount == 0 {
+            return Err(());
+        }
+        provider.period_net_ggr = 0;
+        provider.period_fee_charged = 0;
+        provider.fee_owed_since_last_sweep = 0;
+        pool.pending_provider_fee = pool.pending_provider_fee.checked_sub(amount).unwrap();
+        pool.provider_owed_total = pool.provider_owed_total.checked_add(amount).unwrap();
+        Ok(amount)
+    }
+
+    #[test]
+    fn negative_unwind_nets_the_released_fee_off_its_basis() {
+        let mut a = fresh_pool(Pubkey::new_unique());
+        let mut pa = fresh_provider(1_000);
+        submit_step(&mut a, &mut pa, 1_000_000_000);
+        let after_win = sum_earmarks(&a) - a.pending_provider_fee;
+        submit_step(&mut a, &mut pa, -400_000_000);
+        let a4 = sum_earmarks(&a) - a.pending_provider_fee;
+
+        let mut b = fresh_pool(Pubkey::new_unique());
+        let mut pb = fresh_provider(1_000);
+        submit_step(&mut b, &mut pb, -400_000_000);
+        submit_step(&mut b, &mut pb, 1_000_000_000);
+        let b4 = sum_earmarks(&b) - b.pending_provider_fee;
+
+        assert_eq!(pa.period_fee_charged, 60_000_000, "A: 10% of the $600 period net");
+        assert_eq!(pb.period_fee_charged, 60_000_000, "B: same period, same fee");
+        assert_eq!(a.pending_provider_fee, b.pending_provider_fee);
+
+        let drift = if a4 > b4 { a4 - b4 } else { b4 - a4 };
+        assert!(
+            drift <= 8,
+            "orderings diverged by {drift} (only floor-division dust is \
+             acceptable). A={a4} B={b4}. The negative-unwind basis must be \
+             `abs_loss − fee_release`, not the raw loss."
+        );
+        assert!(after_win > a4, "the loss must still unwind the buckets");
+    }
+
+    #[test]
+    fn rate_change_guard_implies_nothing_charged() {
+        let src = include_str!("lib.rs");
+        let program_src = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("program code precedes the #[cfg(test)] module");
+        let fee_write = format!(".{} = ", "period_fee_charged");
+        let net_write = format!(".{} = ", "period_net_ggr");
+        let fee_writes = program_src.matches(&fee_write).count();
+        let net_writes = program_src.matches(&net_write).count();
+        assert_eq!(
+            fee_writes, 3,
+            "expected EXACTLY the three known production writes to \
+             period_fee_charged (add_provider zero-init, submit fee_step, \
+             flush period-close reset); saw {fee_writes}. A new writer must \
+             re-prove `period_net_ggr <= 0 ⇒ period_fee_charged == 0` and \
+             only then update this count."
+        );
+        assert_eq!(
+            net_writes, 3,
+            "expected EXACTLY the three known production writes to \
+             period_net_ggr; saw {net_writes} — see the period_fee_charged \
+             assert above."
+        );
+        for op in ["+=", "-=", "*=", "/="] {
+            for field in ["period_fee_charged", "period_net_ggr"] {
+                let needle = format!(".{field} {op}");
+                assert!(
+                    !program_src.contains(&needle),
+                    "no production compound assignment to {field} is allowed \
+                     (found `{needle}`)"
+                );
+            }
+        }
+        let paired_step = format!(
+            "provider.{} = fee_step.period_net_after;\n        provider.{} = fee_step.fee_target;",
+            "period_net_ggr", "period_fee_charged"
+        );
+        let paired_zero = format!(
+            "provider.{} = 0;\n        provider.{} = 0;",
+            "period_net_ggr", "period_fee_charged"
+        );
+        assert_eq!(
+            program_src.matches(&paired_step).count(),
+            1,
+            "the single non-zero write to period_fee_charged MUST be paired \
+             with the period_net_ggr write from the SAME fee_step — otherwise \
+             the two can drift and `period_net <= 0 ⇒ charged == 0` stops \
+             holding"
+        );
+        assert_eq!(
+            program_src.matches(&paired_zero).count(),
+            2,
+            "expected exactly two paired zero-resets (add_provider init + \
+             flush_provider_fee period close)"
+        );
+
+        let mut pool = fresh_pool(Pubkey::new_unique());
+        let mut provider = fresh_provider(1_000);
+        for net in [
+            900_000_000i64,
+            -1_400_000_000,
+            300_000_000,
+            2_000_000_000,
+            -2_500_000_000,
+            -100_000_000,
+            1_100_000_000,
+            0,
+        ] {
+            submit_step(&mut pool, &mut provider, net);
+            if provider.period_net_ggr <= 0 {
+                assert_eq!(
+                    provider.period_fee_charged, 0,
+                    "period_net_ggr <= 0 MUST imply period_fee_charged == 0 \
+                     (net={net}); the rate-change guard relies on it"
+                );
+            }
+        }
+        let fresh = fresh_provider(1_000);
+        assert!(fresh.period_net_ggr <= 0 && fresh.period_fee_charged == 0);
+    }
+
+    #[derive(AnchorSerialize, AnchorDeserialize)]
+    struct LegacyProviderLayout {
+        provider_id: u32,
+        name: [u8; PROVIDER_NAME_LEN],
+        bump: u8,
+        active: bool,
+        paused: bool,
+        paused_at: i64,
+        settle_paused: bool,
+        pause_reason: [u8; PAUSE_REASON_LEN],
+        provider_fee_bps: u16,
+        fee_owed_since_last_sweep: u64,
+        affiliate_recorder_pubkey: Pubkey,
+        signed_terms_hash: [u8; 32],
+        cumulative_gross_ggr: i64,
+        cumulative_gross_wager: u64,
+        cumulative_gross_payout: u64,
+        cumulative_bet_count: u64,
+        last_submission_at: i64,
+        last_day_id: u64,
+        reserved: [u8; 64],
+    }
+
+    #[test]
+    fn legacy_reserved64_bytes_deserialize_into_current_provider() {
+        let recorder = Pubkey::new_unique();
+        let legacy = LegacyProviderLayout {
+            provider_id: 7,
+            name: [0xAB; PROVIDER_NAME_LEN],
+            bump: 254,
+            active: true,
+            paused: false,
+            paused_at: -123_456_789,
+            settle_paused: true,
+            pause_reason: [0xCD; PAUSE_REASON_LEN],
+            provider_fee_bps: 1_000,
+            fee_owed_since_last_sweep: 217_972_000,
+            affiliate_recorder_pubkey: recorder,
+            signed_terms_hash: [0xEF; 32],
+            cumulative_gross_ggr: -1_851_644_605,
+            cumulative_gross_wager: 65_270_950_000,
+            cumulative_gross_payout: 64_942_870_000,
+            cumulative_bet_count: 4_065,
+            last_submission_at: 1_784_000_000,
+            last_day_id: 20_664,
+            reserved: [0u8; 64],
+        };
+        let legacy_bytes = legacy.try_to_vec().expect("legacy serializes");
+
+        assert_eq!(
+            legacy_bytes.len(),
+            Provider::LEN - 8,
+            "legacy and current layouts must be byte-size identical"
+        );
+
+        let migrated = Provider::deserialize(&mut legacy_bytes.as_slice())
+            .expect("legacy bytes must deserialize as the current Provider");
+
+        assert_eq!(migrated.provider_id, 7);
+        assert_eq!(migrated.name, [0xAB; PROVIDER_NAME_LEN]);
+        assert_eq!(migrated.bump, 254);
+        assert!(migrated.active);
+        assert!(!migrated.paused);
+        assert_eq!(migrated.paused_at, -123_456_789);
+        assert!(migrated.settle_paused);
+        assert_eq!(migrated.pause_reason, [0xCD; PAUSE_REASON_LEN]);
+        assert_eq!(migrated.provider_fee_bps, 1_000);
+        assert_eq!(migrated.fee_owed_since_last_sweep, 217_972_000);
+        assert_eq!(migrated.affiliate_recorder_pubkey, recorder);
+        assert_eq!(migrated.signed_terms_hash, [0xEF; 32]);
+        assert_eq!(migrated.cumulative_gross_ggr, -1_851_644_605);
+        assert_eq!(migrated.cumulative_gross_wager, 65_270_950_000);
+        assert_eq!(migrated.cumulative_gross_payout, 64_942_870_000);
+        assert_eq!(migrated.cumulative_bet_count, 4_065);
+        assert_eq!(migrated.last_submission_at, 1_784_000_000);
+        assert_eq!(migrated.last_day_id, 20_664);
+
+        assert_eq!(migrated.period_net_ggr, 0);
+        assert_eq!(migrated.period_fee_charged, 0);
+        assert_eq!(migrated.fee_correction_applied, 0);
+        assert_eq!(migrated.reserved, [0u8; 47]);
+
+        assert_eq!(
+            migrated.try_to_vec().expect("current serializes"),
+            legacy_bytes,
+            "current Provider must re-serialize to the exact legacy bytes"
+        );
+    }
+
+    #[test]
+    fn rate_drop_release_would_be_misrouted_to_lp_nav_if_unguarded() {
+        let mut pool = fresh_pool(Pubkey::new_unique());
+        let mut provider = fresh_provider(1_000);
+
+        submit_step(&mut pool, &mut provider, 1_000_000_000);
+        assert_eq!(provider.period_fee_charged, 100_000_000);
+        let buckets_before = sum_earmarks(&pool) - pool.pending_provider_fee;
+
+        provider.provider_fee_bps = 0;
+        let step = provider_period_fee_step(
+            provider.period_net_ggr,
+            1_000_000,
+            provider.period_fee_charged,
+            0,
+        )
+        .unwrap();
+        assert_eq!(step.decrease, 100_000_000, "the whole $100 is released");
+        assert_eq!(step.increase, 0);
+
+        let split4_of_release = {
+            let base: u128 = 100_000_000;
+            let dev = base * DEFAULT_DEV_FEE_BPS as u128 / 10_000;
+            let after_dev = base - dev;
+            let lp = after_dev * DEFAULT_LP_SHARE_BPS as u128 / 10_000;
+            let protocol = after_dev - lp;
+            let sov = protocol * SOVEREIGN_CARVE_BPS as u128 / 10_000;
+            let tax = protocol - sov;
+            let (yb, cb, _) = phase_split_bps(0);
+            let yld = tax * yb as u128 / 10_000;
+            let comp = tax * cb as u128 / 10_000;
+            let reserve = tax - yld - comp;
+            (dev + sov + yld + reserve) as u64
+        };
+        assert_eq!(
+            split4_of_release, 15_565_000,
+            "the documented misroute magnitude: split4($100) = $15.565"
+        );
+        let _ = buckets_before;
+
+        let mut trial = fresh_pool(Pubkey::new_unique());
+        assert!(
+            accrue_earmarks(
+                &mut trial,
+                1_000_000,
+                0,
+                0,
+                0,
+                DEFAULT_DEV_FEE_BPS,
+                0,
+                step.decrease,
+            )
+            .is_err(),
+            "a positive receipt carrying a fee release MUST revert \
+             (FeeReleaseOnPositiveReceipt) — fail-closed, never silent"
+        );
+    }
+
+    #[test]
+    fn update_provider_fee_blocks_a_rate_change_while_the_period_is_in_profit() {
+        let src = include_str!("lib.rs");
+        let start = src.find("pub fn update_provider_fee(").expect("setter must exist");
+        let end = drift_handler_end(src, start);
+        let body: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("provider.period_net_ggr <= 0")
+                && body.contains("FeeBpsChangeWouldRepriceOpenPeriod"),
+            "update_provider_fee MUST refuse a rate change while the period is \
+             in profit — otherwise a rate cut releases charged fee that the \
+             positive cascade cannot absorb ($15.565 misrouted per $100)"
+        );
+        assert!(
+            !body.contains("period_net_ggr == 0"),
+            "the guard MUST be `<= 0`, not `== 0` — a founder-locked carried \
+             NEGATIVE period keeps period_net_ggr non-zero indefinitely and \
+             would lock the rate setter permanently"
+        );
+        assert!(
+            !body.contains("pending_") && !body.contains("unlocks_at"),
+            "update_provider_fee is INSTANT by design; if a timelock is ever \
+             added, update every comment that documents it as instant"
+        );
+    }
+
+    #[test]
+    fn carry_forward_negative_period_bills_cumulative_net_across_months() {
+        let mut pool = fresh_pool(Pubkey::new_unique());
+        let mut provider = fresh_provider(1_000);
+        let mut billed: u64 = 0;
+
+        submit_step(&mut pool, &mut provider, 1_000_000_000);
+        assert_eq!(provider.period_fee_charged, 100_000_000);
+        billed += try_flush(&mut pool, &mut provider).expect("M1 must flush");
+        assert_eq!(provider.period_net_ggr, 0, "a SETTLED period resets to zero");
+
+        submit_step(&mut pool, &mut provider, -500_000_000);
+        assert_eq!(provider.period_fee_charged, 0, "a losing month owes nothing");
+        assert!(
+            try_flush(&mut pool, &mut provider).is_err(),
+            "a net-negative period MUST NOT be flushable — the NothingOwed revert \
+             is what delivers the carry-forward"
+        );
+        assert_eq!(
+            provider.period_net_ggr, -500_000_000,
+            "the −$500 MUST still be on the books after the failed flush. If this \
+             reads 0, someone re-introduced a period reset for losing months — \
+             that discards the carry and OVERPAYS the provider. Founder-locked \
+             2026-07-31: negative periods carry forward."
+        );
+
+        submit_step(&mut pool, &mut provider, 1_000_000_000);
+        assert_eq!(
+            provider.period_net_ggr, 500_000_000,
+            "M3 must net against the carried −$500, not start fresh at +$1,000"
+        );
+        assert_eq!(provider.period_fee_charged, 50_000_000, "10% of the netted $500");
+        billed += try_flush(&mut pool, &mut provider).expect("M3 must flush");
+
+        assert_eq!(
+            billed, 150_000_000,
+            "cumulative billed MUST be 10% of the $1,500 cumulative net. Without \
+             the carry it would be $200 — 10% of the two winning months only."
+        );
+        let cumulative_net = 1_000_000_000i64 - 500_000_000 + 1_000_000_000;
+        assert_eq!(cumulative_net, 1_500_000_000);
+        assert_eq!(billed, (cumulative_net as u64) / 10);
+    }
+
+    #[test]
+    fn carry_forward_negative_period_survives_multiple_periods() {
+        let mut pool = fresh_pool(Pubkey::new_unique());
+        let mut provider = fresh_provider(1_000);
+        let mut billed: u64 = 0;
+
+        submit_step(&mut pool, &mut provider, 1_000_000_000);
+        billed += try_flush(&mut pool, &mut provider).expect("M1 must flush");
+        assert_eq!(billed, 100_000_000);
+
+        submit_step(&mut pool, &mut provider, -2_000_000_000);
+        assert!(try_flush(&mut pool, &mut provider).is_err(), "M2 must not flush");
+        assert_eq!(provider.period_net_ggr, -2_000_000_000, "the full −$2,000 carries");
+
+        submit_step(&mut pool, &mut provider, 500_000_000);
+        assert_eq!(
+            provider.period_net_ggr, -1_500_000_000,
+            "the carry survives a SECOND period boundary: −2,000 + 500 = −1,500"
+        );
+        assert_eq!(provider.period_fee_charged, 0, "still under water ⇒ zero fee");
+        assert_eq!(pool.pending_provider_fee, 0, "no new accrual");
+        assert!(try_flush(&mut pool, &mut provider).is_err(), "M3 must not flush either");
+
+        submit_step(&mut pool, &mut provider, 2_000_000_000);
+        assert_eq!(provider.period_net_ggr, 500_000_000);
+        assert_eq!(
+            provider.period_fee_charged, 50_000_000,
+            "billed on the $500 that actually cleared the deficit, not the $2,000"
+        );
+        billed += try_flush(&mut pool, &mut provider).expect("M4 must flush");
+        assert_eq!(billed, 150_000_000, "total billed across all four months");
+        assert_eq!(pool.provider_owed_total, 150_000_000);
+    }
+
+    #[test]
+    fn provider_period_fields_are_carved_from_reserved_len_unchanged() {
+        const PRE_CHANGE_LEN: usize = 8 + 4 + 32 + 4 + 8 + 32 + 2 + 8 + 32 + 32 + 48 + 64;
+        assert_eq!(
+            Provider::LEN,
+            PRE_CHANGE_LEN,
+            "carving period_net_ggr(8) + period_fee_charged(8) + \
+             fee_correction_applied(1) out of reserved MUST leave Provider::LEN \
+             identical — otherwise the live account needs a realloc"
+        );
+        assert_eq!(8 + 8 + 1 + 47, 64, "the carve must consume exactly the old reserved");
+    }
+
+
+    #[test]
+    fn fee_correction_is_locked_down_at_the_source() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("pub fn correct_provider_fee_overaccrual(")
+            .expect("correction instruction must exist");
+        let end = drift_handler_end(src, start);
+        let body_owned: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body_owned.as_str();
+
+        assert!(
+            body.contains("ctx.accounts.authority.key()") && body.contains("config.authority"),
+            "correction MUST be gated on config.authority"
+        );
+        assert!(
+            !body.contains("operator_pubkey"),
+            "correction MUST NOT be reachable by the operator key — that key has \
+             live money-path reach and a hot-key compromise must not reach this"
+        );
+        assert!(
+            body.contains("provider.fee_correction_applied == 0")
+                && body.contains("provider.fee_correction_applied = 1"),
+            "correction MUST check and set the one-shot latch"
+        );
+        assert!(
+            body.contains("pool.pending_provider_fee == expected_pending_provider_fee")
+                && body.contains(
+                    "provider.fee_owed_since_last_sweep == expected_fee_owed_since_last_sweep"
+                ),
+            "correction MUST bind the attested pre-state of BOTH fee mirrors"
+        );
+        assert!(
+            body.contains("new_pending_provider_fee < expected_pending_provider_fee"),
+            "correction MUST strictly DECREASE — it can never raise a bucket"
+        );
+        assert!(
+            body.contains("delta <= expected_fee_owed_since_last_sweep"),
+            "the reduction MUST be absorbable by this provider's un-flushed slice \
+             so it cannot reach into another provider's or into provider_owed_total"
+        );
+        assert_eq!(
+            body.matches("require_earmark_invariant(pool, holder_balance)?").count(),
+            1,
+            "K4 MUST be checked exactly once, on the POST-mutation state"
+        );
+        let k4_pos = body
+            .find("require_earmark_invariant(pool, holder_balance)?")
+            .expect("K4 check must exist");
+        let mutate_pos = body
+            .find("provider.fee_correction_applied = 1")
+            .expect("the one-shot latch write must exist");
+        assert!(
+            k4_pos > mutate_pos,
+            "the K4 check MUST come AFTER the mutation — a pre-check refuses to \
+             run exactly when solvency is broken"
+        );
+        for guard in [
+            "require!(!config.is_frozen",
+            "require!(!ctx.accounts.vault_config.is_frozen",
+        ] {
+            assert!(
+                !body.contains(guard),
+                "the correction MUST NOT gate on is_frozen (`{guard}`) — freeze → \
+                 upgrade → correct → verify → unfreeze is the ceremony that closes \
+                 the flush window; is_paused does NOT block flush_provider_fee"
+            );
+        }
+        for forbidden in [
+            "pending_dev_fee =",
+            "pending_sovereign =",
+            "pending_yield =",
+            "pending_reserve =",
+            "pending_affiliate =",
+            "pending_promo =",
+            "provider_owed_total =",
+            "transfer_checked",
+            "period_net_ggr =",
+            "period_fee_charged =",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "correction MUST NOT touch `{forbidden}` — it is a one-shot fee \
+                 correction, not a bucket setter"
+            );
+        }
+        assert!(
+            !body.contains("saturating_sub"),
+            "correction MUST use checked_sub so a bound violation reverts"
+        );
+    }
+
+    #[test]
+    fn flush_resets_the_period_accumulators_at_the_source() {
+        let src = include_str!("lib.rs");
+        let start = src.find("pub fn flush_provider_fee(").expect("flush must exist");
+        let end = drift_handler_end(src, start);
+        let body = &src[start..end];
+        assert!(
+            body.contains("provider.period_net_ggr = 0")
+                && body.contains("provider.period_fee_charged = 0"),
+            "flush_provider_fee MUST reset BOTH period accumulators — otherwise a \
+             later loss could claw back an already-invoiced fee"
+        );
+    }
+
+    #[test]
+    fn submit_routes_the_provider_fee_through_the_period_rule() {
+        let src = include_str!("lib.rs");
+        let start = src.find("pub fn submit_provider_ggr(").expect("submit must exist");
+        let end = drift_handler_end(src, start);
+        let body = &src[start..end];
+        assert!(
+            body.contains("provider_period_fee_step("),
+            "submit MUST compute the fee via the period rule"
+        );
+        assert!(
+            body.contains("reduce_provider_fee_accrual(pool, provider, fee_step.decrease)"),
+            "submit MUST apply the downward leg through the shared lockstep helper"
+        );
+        assert!(
+            body.contains("let fee_due: u64 = fee_step.increase;"),
+            "the cascade deduction MUST be the period DELTA, not the fee on gross"
+        );
+        assert!(
+            !body.contains("let fee_due: u64 = if net_ggr_signed > 0 {"),
+            "the per-receipt gross-fee formula MUST NOT survive anywhere in submit"
+        );
+    }
+
+
     #[test]
     fn historical_receipts_preserve_fee_bps_at_accrual() {
         let r1_bps_snapshot: u16 = 1_000;
@@ -8775,7 +9844,7 @@ mod tests {
         a.pending_yield = 2_000;
         b.pending_dev_fee = 5_000;
         b.pending_yield = 8_000;
-        accrue_earmarks(&mut a, -10_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut a, -10_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert_eq!(b.pending_dev_fee, 5_000);
         assert_eq!(b.pending_yield, 8_000);
     }
@@ -9030,7 +10099,7 @@ mod tests {
         for day in 0..5 {
             let net = 250_000_000i64;
             let fee_due = (net as u64) * DEFAULT_PROVIDER_FEE_BPS as u64 / 10_000;
-            accrue_earmarks(&mut p, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee_due, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+            accrue_earmarks(&mut p, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee_due, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
             accrue_affiliate_amount(&mut p, 8_000_000).unwrap();
             p.cumulative_gross_ggr += net;
             let _ = day;
@@ -9049,7 +10118,7 @@ mod tests {
         p.lp_tokens_by_tier = [0, 0, 100, 0, 0];
 
         let net1 = 100_000_000i64;
-        accrue_earmarks(&mut p, net1, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net1, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         accrue_affiliate_amount(&mut p, 50_000_000).unwrap();
         p.cumulative_gross_ggr += net1;
 
@@ -9059,7 +10128,7 @@ mod tests {
 
         let net2 = 2_000_000_000i64;
         let fee_due2 = (net2 as u64) * DEFAULT_PROVIDER_FEE_BPS as u64 / 10_000;
-        accrue_earmarks(&mut p, net2, 1, DEFAULT_PROVIDER_FEE_BPS, fee_due2, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net2, 1, DEFAULT_PROVIDER_FEE_BPS, fee_due2, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         accrue_affiliate_amount(&mut p, 10_000_000).unwrap();
         p.cumulative_gross_ggr += net2;
 
@@ -9090,7 +10159,7 @@ mod tests {
     fn multi_asset_accrual_to_one_does_not_affect_other_invariant() {
         let mut a = fresh_pool(Pubkey::new_unique());
         let mut b = fresh_pool(Pubkey::new_unique());
-        accrue_earmarks(&mut a, 1_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 100_000, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut a, 1_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 100_000, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert!(b.pending_dev_fee == 0);
         assert!(b.pending_provider_fee == 0);
         assert!(b.pending_sovereign == 0);
@@ -9231,7 +10300,10 @@ mod tests {
             cumulative_bet_count: 0,
             last_submission_at: 0,
             last_day_id: 0,
-            reserved: [0u8; 64],
+            period_net_ggr: 0,
+            period_fee_charged: 0,
+            fee_correction_applied: 0,
+            reserved: [0u8; 47],
         };
         assert!(p.settle_paused);
         p.settle_paused = false;
@@ -9310,7 +10382,10 @@ mod tests {
             cumulative_bet_count: 0,
             last_submission_at: 0,
             last_day_id: 0,
-            reserved: [0u8; 64],
+            period_net_ggr: 0,
+            period_fee_charged: 0,
+            fee_correction_applied: 0,
+            reserved: [0u8; 47],
         };
         let _x: i64 = p.cumulative_gross_ggr;
         let _y: u64 = p.cumulative_gross_wager;
@@ -9432,12 +10507,12 @@ mod tests {
     fn mixed_pattern_y_sequence_sum_integrity() {
         let mut p = fresh_pool(Pubkey::new_unique());
         p.lp_tokens_by_tier = [0, 0, 100, 0, 0];
-        accrue_earmarks(&mut p, 1_000_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 100_000_000, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, 1_000_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 100_000_000, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         let after_pos_dev = p.pending_dev_fee;
-        accrue_earmarks(&mut p, -200_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, -200_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         let after_neg_dev = p.pending_dev_fee;
         assert!(after_neg_dev < after_pos_dev);
-        accrue_earmarks(&mut p, 500_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 50_000_000, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, 500_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 50_000_000, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         let after_final_dev = p.pending_dev_fee;
         assert!(after_final_dev > after_neg_dev);
     }
@@ -9464,7 +10539,10 @@ mod tests {
             cumulative_bet_count: 0,
             last_submission_at: 0,
             last_day_id: 0,
-            reserved: [0u8; 64],
+            period_net_ggr: 0,
+            period_fee_charged: 0,
+            fee_correction_applied: 0,
+            reserved: [0u8; 47],
         };
         assert!(!p.active);
     }
@@ -9490,7 +10568,10 @@ mod tests {
             cumulative_bet_count: 0,
             last_submission_at: 0,
             last_day_id: 0,
-            reserved: [0u8; 64],
+            period_net_ggr: 0,
+            period_fee_charged: 0,
+            fee_correction_applied: 0,
+            reserved: [0u8; 47],
         };
         assert!(p.paused);
     }
@@ -9725,7 +10806,7 @@ mod tests {
         p.lp_tokens_by_tier = [0, 0, 100, 0, 0];
         let net = 1_000_000_000i64;
         let provider_fee: u64 = (net as u64) * 1_000 / 10_000;
-        accrue_earmarks(&mut p, net, 1, 1_000, provider_fee, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut p, net, 1, 1_000, provider_fee, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         assert_eq!(p.pending_dev_fee, 22_500_000);
     }
 
@@ -10315,8 +11396,8 @@ mod tests {
         let net: i64 = 1_000_000_000;
         let provider_fee: u64 = 100_000_000;
 
-        accrue_earmarks(&mut p_a, net, 1, DEFAULT_PROVIDER_FEE_BPS, provider_fee, 250, 0).unwrap();
-        accrue_earmarks(&mut p_b, net, 1, DEFAULT_PROVIDER_FEE_BPS, provider_fee, 500, 0).unwrap();
+        accrue_earmarks(&mut p_a, net, 1, DEFAULT_PROVIDER_FEE_BPS, provider_fee, 250, 0, 0).unwrap();
+        accrue_earmarks(&mut p_b, net, 1, DEFAULT_PROVIDER_FEE_BPS, provider_fee, 500, 0, 0).unwrap();
 
         assert!(p_b.pending_dev_fee > p_a.pending_dev_fee,
             "expected pending_dev_fee at 500bps ({}) > 250bps ({})",
@@ -10330,21 +11411,21 @@ mod tests {
     fn accrue_earmarks_rejects_bps_above_max() {
         let mut p = fresh_pool(Pubkey::new_unique());
         let too_high = MAX_DEV_FEE_BPS + 1;
-        let res = accrue_earmarks(&mut p, 1_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, too_high, 0);
+        let res = accrue_earmarks(&mut p, 1_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, too_high, 0, 0);
         assert!(res.is_err(), "accrue_earmarks must reject bps > MAX_DEV_FEE_BPS");
     }
 
     #[test]
     fn accrue_earmarks_accepts_bps_at_max() {
         let mut p = fresh_pool(Pubkey::new_unique());
-        let res = accrue_earmarks(&mut p, 1_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, MAX_DEV_FEE_BPS, 0);
+        let res = accrue_earmarks(&mut p, 1_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, MAX_DEV_FEE_BPS, 0, 0);
         assert!(res.is_ok(), "accrue_earmarks must accept bps == MAX_DEV_FEE_BPS");
     }
 
     #[test]
     fn accrue_earmarks_accepts_zero_bps() {
         let mut p = fresh_pool(Pubkey::new_unique());
-        accrue_earmarks(&mut p, 1_000_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 100_000_000, 0, 0).unwrap();
+        accrue_earmarks(&mut p, 1_000_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 100_000_000, 0, 0, 0).unwrap();
         assert_eq!(p.pending_dev_fee, 0);
     }
 
@@ -11803,9 +12884,9 @@ mod tests {
         let promo = 200_000_000u64;
 
         let mut base = fresh_pool(Pubkey::new_unique());
-        accrue_earmarks(&mut base, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut base, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
         let mut netted = fresh_pool(Pubkey::new_unique());
-        accrue_earmarks(&mut netted, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, promo).unwrap();
+        accrue_earmarks(&mut netted, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, promo, 0).unwrap();
 
         assert_eq!(netted.pending_provider_fee, base.pending_provider_fee, "provider_fee MUST stay GROSS");
         assert_eq!(netted.pending_provider_fee, fee, "provider_fee == fee_due (GROSS)");
@@ -11830,7 +12911,7 @@ mod tests {
         let after_provider = (net as u64) - fee;
 
         let mut baseline = fresh_pool(Pubkey::new_unique());
-        accrue_earmarks(&mut baseline, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, 0).unwrap();
+        accrue_earmarks(&mut baseline, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, 0, 0).unwrap();
 
         let r: u64 = 300_000_000;
         let mut pool = fresh_pool(Pubkey::new_unique());
@@ -11839,7 +12920,7 @@ mod tests {
         let own_promo = pool.promo_paid_unreconciled.saturating_sub(pool.network_reimbursement_owed);
         let promo_to_net = own_promo.min(after_provider);
         assert_eq!(promo_to_net, 0, "a purely-reimbursable promo nets ZERO at submit");
-        accrue_earmarks(&mut pool, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, promo_to_net).unwrap();
+        accrue_earmarks(&mut pool, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, promo_to_net, 0).unwrap();
 
         assert_eq!(pool.pending_dev_fee, baseline.pending_dev_fee, "dev_fee conserved");
         assert_eq!(pool.pending_sovereign, baseline.pending_sovereign, "sovereign conserved");
@@ -11900,12 +12981,12 @@ mod tests {
         let fee = 100_000_000u64;
         let mut p1 = fresh_pool(Pubkey::new_unique());
         assert!(
-            accrue_earmarks(&mut p1, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, 900_000_001).is_err(),
+            accrue_earmarks(&mut p1, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, 900_000_001, 0).is_err(),
             "promo exceeding the post-provider base MUST revert"
         );
         let mut p2 = fresh_pool(Pubkey::new_unique());
         assert!(
-            accrue_earmarks(&mut p2, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, 900_000_000).is_ok(),
+            accrue_earmarks(&mut p2, net, 1, DEFAULT_PROVIDER_FEE_BPS, fee, DEFAULT_DEV_FEE_BPS, 900_000_000, 0).is_ok(),
             "promo == after_provider is allowed (distribution_base = 0)"
         );
     }
@@ -11914,12 +12995,12 @@ mod tests {
     fn accrue_earmarks_negative_receipt_requires_zero_promo() {
         let mut p1 = fresh_pool(Pubkey::new_unique());
         assert!(
-            accrue_earmarks(&mut p1, -100_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 1).is_err(),
+            accrue_earmarks(&mut p1, -100_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 1, 0).is_err(),
             "nonzero promo on a negative receipt MUST revert (caller-contract guard)"
         );
         let mut p2 = fresh_pool(Pubkey::new_unique());
         assert!(
-            accrue_earmarks(&mut p2, -100_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0).is_ok(),
+            accrue_earmarks(&mut p2, -100_000_000, 1, DEFAULT_PROVIDER_FEE_BPS, 0, DEFAULT_DEV_FEE_BPS, 0, 0).is_ok(),
             "cost_netted == 0 on a negative receipt is the correct call"
         );
     }
